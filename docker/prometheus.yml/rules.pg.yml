@@ -1,0 +1,21 @@
+groups:
+- name: pg_master
+  rules:
+  - record: pg_master_db_size_mb
+    expr: pg_database_size_bytes{datname="postgres", job="postgres_master"} / 1024 / 1024
+  - record: pg_master_db_tps
+    expr: rate(pg_stat_database_xact_commit{datname="postgres", job="postgres_master"}[1m]) + rate(pg_stat_database_xact_rollback{datname="postgres", job="postgres_master"}[1m])
+
+- name: pg_phys
+  rules:
+  - record: pg_phys_db_size_mb
+    expr: pg_database_size_bytes{datname="postgres", job="postgres_phys"} / 1024 / 1024
+  - record: pg_phys_db_tps
+    expr: rate(pg_stat_database_xact_commit{datname="postgres", job="postgres_phys"}[1m]) + rate(pg_stat_database_xact_rollback{datname="postgres", job="postgres_phys"}[1m])
+
+- name: pg_logic
+  rules:
+  - record: pg_logic_db_size_mb
+    expr: pg_database_size_bytes{datname="postgres", job="postgres_logic"} / 1024 / 1024
+  - record: pg_logic_db_tps
+    expr: rate(pg_stat_database_xact_commit{datname="postgres", job="postgres_logic"}[1m]) + rate(pg_stat_database_xact_rollback{datname="postgres", job="postgres_logic"}[1m])

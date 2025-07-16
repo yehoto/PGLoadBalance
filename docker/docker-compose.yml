@@ -1,0 +1,112 @@
+version: "3.9"
+
+services:
+  master:
+    image: postgres:17
+    container_name: pg_master
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust 
+    ports:
+      - "5435:5432"
+    volumes:
+      - ./init-master.sql:/docker-entrypoint-initdb.d/01_master_init.sql
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+      -c hot_standby=on
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  phys_replica:
+    image: postgres:17
+    container_name: pg_phys_replica
+    restart: unless-stopped
+    environment:
+      PGUSER: replicator
+      PGPASSWORD: replicator_pass
+    depends_on:
+      master:
+        condition: service_healthy
+    ports:
+      - "5433:5432"
+    command: >
+      bash -c "
+        until pg_basebackup -h master -p 5432 -D $$PGDATA \
+               -U replicator -R -X stream -C -S phys_slot; do
+          echo 'waiting for master...'; sleep 1;
+        done;
+        postgres -c hot_standby=on
+      "
+
+  logic_replica:
+    image: postgres:17
+    container_name: pg_logic_replica
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: password
+      PGUSER: replicator
+      PGPASSWORD: replicator_pass
+    depends_on:
+      master:
+        condition: service_healthy
+    ports:
+      - "5434:5432"
+    command: >
+      bash -c "
+        until pg_basebackup -h master -p 5432 -D $$PGDATA \
+               -U replicator -R -X stream; do
+          echo 'waiting for master...'; sleep 1;
+        done;
+        echo \"wal_level=logical\" >> $$PGDATA/postgresql.conf;
+        postgres
+      " 
+
+  loadgen:
+    build:
+      context: ..  
+    command: ["/loadgen", "-min-size", "100", "-max-size", "300"]
+    ports:
+      - "2112:2112" 
+    environment:
+      - DSN=postgres://postgres@master:5432/postgres?sslmode=disable
+    depends_on:
+      master:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    volumes:
+      - ./prometheus.yml/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus.yml/rules.pg.yml:/etc/prometheus/rules.pg.yml:ro
+    ports:
+      - "9090:9090"
+
+  pg_exporter_master:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    environment:
+      - DATA_SOURCE_NAME=postgresql://postgres@master:5432/postgres?sslmode=disable
+    depends_on:
+      master:
+        condition: service_healthy
+
+  pg_exporter_phys:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    environment:
+      - DATA_SOURCE_NAME=postgresql://replicator:replicator_pass@phys_replica:5432/postgres?sslmode=disable
+    depends_on:
+      phys_replica:
+        condition: service_started
+
+  pg_exporter_logic:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    environment:
+      - DATA_SOURCE_NAME=postgresql://replicator:replicator_pass@logic_replica:5432/postgres?sslmode=disable
+    depends_on:
+      logic_replica:
+        condition: service_started 
