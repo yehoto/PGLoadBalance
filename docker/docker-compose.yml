@@ -121,7 +121,7 @@ services:
     image: prom/prometheus:latest
     volumes:
       - ./prometheus.yml/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./prometheus.yml/rules.pg.yml:/etc/prometheus/rules.pg.yml:ro
+      #- ./prometheus.yml/rules.pg.yml:/etc/prometheus/rules.pg.yml:ro
     ports:
       - "9090:9090"
     networks:
