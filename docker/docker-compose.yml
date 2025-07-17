@@ -1,4 +1,4 @@
-version: "3.9"
+version: "3.8"
 
 services:
   master:
@@ -6,10 +6,15 @@ services:
     container_name: pg_master
     restart: unless-stopped
     environment:
-      POSTGRES_HOST_AUTH_METHOD: trust 
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_HOST_AUTH_METHOD=scram-sha-256
+      - POSTGRES_INITDB_ARGS=--data-checksums
     ports:
       - "5435:5432"
     volumes:
+      - pg_master_data:/var/lib/postgresql/data
       - ./init-master.sql:/docker-entrypoint-initdb.d/01_master_init.sql
     command: >
       postgres
@@ -17,19 +22,22 @@ services:
       -c max_wal_senders=10
       -c max_replication_slots=10
       -c hot_standby=on
+      -c hba_file=/var/lib/postgresql/data/pg_hba.conf
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - my-docker-network
 
   phys_replica:
     image: postgres:17
     container_name: pg_phys_replica
     restart: unless-stopped
     environment:
-      PGUSER: replicator
-      PGPASSWORD: replicator_pass
+      PGUSER: ${REPLICATOR_USER}  # Use env vars
+      PGPASSWORD: ${REPLICATOR_PASS}
     depends_on:
       master:
         condition: service_healthy
@@ -38,20 +46,28 @@ services:
     command: >
       bash -c "
         until pg_basebackup -h master -p 5432 -D $$PGDATA \
-               -U replicator -R -X stream -C -S phys_slot; do
+              U replicator R -X stream -C -S phys_slot; do
           echo 'waiting for master...'; sleep 1;
         done;
         postgres -c hot_standby=on
       "
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"] #Or replicate user if desired.
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - my-docker-network
 
   logic_replica:
     image: postgres:17
     container_name: pg_logic_replica
     restart: unless-stopped
     environment:
-      POSTGRES_PASSWORD: password
-      PGUSER: replicator
-      PGPASSWORD: replicator_pass
+      POSTGRES_USER: ${POSTGRES_USER}  #Use env vars
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGUSER: ${REPLICATOR_USER}
+      PGPASSWORD: ${REPLICATOR_PASS}
     depends_on:
       master:
         condition: service_healthy
@@ -60,53 +76,81 @@ services:
     command: >
       bash -c "
         until pg_basebackup -h master -p 5432 -D $$PGDATA \
-               -U replicator -R -X stream; do
+              U replicator R -X stream; do
           echo 'waiting for master...'; sleep 1;
         done;
         echo \"wal_level=logical\" >> $$PGDATA/postgresql.conf;
         postgres
-      " 
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - my-docker-network
 
   loadgen:
     build:
-      context: ..  
+      context: ..
     command: ["/loadgen", "-min-size", "100", "-max-size", "300"]
     ports:
-      - "2112:2112" 
+      - "2112:2112"
     environment:
-      - DSN=postgres://postgres@master:5432/postgres?sslmode=disable
+      - DSN=postgres://${POSTGRES_USER}@master:5432/${POSTGRES_DB}?sslmode=disable #TODO: SSL
     depends_on:
       master:
         condition: service_healthy
+    networks:
+      - my-docker-network
 
   prometheus:
-    image: prom/prometheus:v3.5.0
+    image: prom/prometheus:latest
     volumes:
       - ./prometheus.yml/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus.yml/rules.pg.yml:/etc/prometheus/rules.pg.yml:ro
     ports:
       - "9090:9090"
+    networks:
+      - my-docker-network
 
   pg_exporter_master:
-    image: prometheuscommunity/postgres-exporter:v0.15.0
+    image: prometheuscommunity/postgres-exporter:latest
     environment:
-      - DATA_SOURCE_NAME=postgresql://postgres@master:5432/postgres?sslmode=disable
+      - DATA_SOURCE_NAME=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@master:5432/${POSTGRES_DB}?sslmode=disable #TODO: SSL
     depends_on:
       master:
         condition: service_healthy
+    networks:
+      - my-docker-network
 
   pg_exporter_phys:
-    image: prometheuscommunity/postgres-exporter:v0.15.0
+    image: prometheuscommunity/postgres-exporter:latest
     environment:
-      - DATA_SOURCE_NAME=postgresql://replicator:replicator_pass@phys_replica:5432/postgres?sslmode=disable
+      - DATA_SOURCE_NAME=postgresql://${REPLICATOR_USER}:${REPLICATOR_PASS}@phys_replica:5432/${POSTGRES_DB}?sslmode=disable #TODO: SSL
     depends_on:
       phys_replica:
-        condition: service_started
+        condition: service_healthy
+    networks:
+      - my-docker-network
 
   pg_exporter_logic:
-    image: prometheuscommunity/postgres-exporter:v0.15.0
+    image: prometheuscommunity/postgres-exporter:latest
     environment:
-      - DATA_SOURCE_NAME=postgresql://replicator:replicator_pass@logic_replica:5432/postgres?sslmode=disable
+      - DATA_SOURCE_NAME=postgresql://${REPLICATOR_USER}:${REPLICATOR_PASS}@logic_replica:5432/${POSTGRES_DB}?sslmode=disable #TODO: SSL
     depends_on:
       logic_replica:
-        condition: service_started 
+        condition: service_healthy
+    networks:
+      - my-docker-network
+
+networks:
+  my-docker-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.18.0.0/16
+volumes:
+  pg_master_data:
+  pg_phys_replica_data:
+  pg_logic_replica_data:
