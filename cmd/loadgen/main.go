@@ -4,30 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
-	"net/http"
 	"os"
-	"time"
-
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-
 	"PGLoadBalance/internal/config"
 	"PGLoadBalance/internal/loadgen"
 	"PGLoadBalance/internal/monitoring"
 	"PGLoadBalance/internal/postgres"
-)
-
-//метрики для Prometheus
-var (
-	dbSizeGauge = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "pgloadbalance_db_size_mb",
-		Help: "Current database size in MB.",
-	})
-	tpsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "pgloadbalance_db_tps",
-		Help: "Transactions per second (commit + rollback).",
-	})
 )
 
 func main() {
@@ -54,31 +35,7 @@ func main() {
 	defer pool.Close()//Автоматические закрытие при выходе
     //Инициализация системы мониторинга
 	mon := monitoring.New(pool)
-
-	// регистрируем метрики
-	prometheus.MustRegister(dbSizeGauge, tpsGauge)
-
-	// запускаем HTTP-сервер для /metrics
-	go func() {
-		http.Handle("/metrics", promhttp.Handler())
-		if err := http.ListenAndServe(":2112", nil); err != nil {
-			log.Fatalf("metrics server error: %v", err)
-		}
-	}()
-
-	// Фоновое обновление метрик каждую секунду
-	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			if size, err := mon.GetDBSize(); err == nil {
-				dbSizeGauge.Set(float64(size))
-			}
-			if tps, err := mon.GetTPS(); err == nil {
-				tpsGauge.Set(tps)
-			}
-		}
-	}()
+	
 //Создание и запуск генератора нагрузки
 	lg := loadgen.New(pool, mon, *minSize, *maxSize, *workers)
 	ctx := context.Background()

@@ -17,7 +17,8 @@ CREATE PUBLICATION my_publication FOR ALL TABLES;
 
 -- Configure pg_hba.conf using SQL
 CREATE TEMP TABLE hba_temp (line text);
-INSERT INTO hba_temp VALUES 
+INSERT INTO hba_temp VALUES
+  ('local all all trust'),
   ('host replication replicator 172.18.0.0/16 scram-sha-256'),
   ('host all all 172.18.0.0/16 scram-sha-256');
 COPY hba_temp TO '/var/lib/postgresql/data/pg_hba.conf';
