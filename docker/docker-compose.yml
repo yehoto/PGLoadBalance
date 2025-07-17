@@ -34,6 +34,8 @@ services:
   phys_replica:
     image: postgres:17
     container_name: pg_phys_replica
+    volumes:
+      - pg_phys_replica_data:/var/lib/postgresql/data
     restart: unless-stopped
     environment:
       PGUSER: ${REPLICATOR_USER}
@@ -45,13 +47,16 @@ services:
       - "5433:5432"
     command: >
       bash -c "
-        until pg_basebackup -h master -p 5432 -D $$PGDATA -U replicator -R -X stream -C -S phys_slot; do
+        rm -rf $$PGDATA/*;
+        chmod 700 $$PGDATA;
+        until gosu postgres pg_basebackup -h master -p 5432 -D $$PGDATA -U replicator -R -X stream; do
           echo 'waiting for master...'; sleep 2;
         done;
         echo \"primary_conninfo='host=master port=5432 user=replicator password=replicator_pass'\" >> $$PGDATA/postgresql.conf;
         echo \"primary_slot_name='phys_slot'\" >> $$PGDATA/postgresql.conf;
-        postgres -c hot_standby=on
+        exec gosu postgres postgres -c hot_standby=on
       "
+
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
