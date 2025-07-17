@@ -127,6 +127,21 @@ services:
     networks:
       - my-docker-network
 
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - my-docker-network
+
   pg_exporter_master:
     image: prometheuscommunity/postgres-exporter:latest
     environment:
@@ -168,3 +183,4 @@ volumes:
   pg_master_data:
   pg_phys_replica_data:
   pg_logic_replica_data:
+  grafana_data:
