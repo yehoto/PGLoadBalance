@@ -109,7 +109,6 @@ func (lg *LoadGen) batchInsert(ctx context.Context) {
 
 	// если уже упёрлись в максимум – выходим
 	if sizeMB >= lg.maxSizeMB {
-		//time.Sleep(100 * time.Millisecond)
 		return
 	}
 
@@ -117,7 +116,6 @@ func (lg *LoadGen) batchInsert(ctx context.Context) {
 	freeBytes := (lg.maxSizeMB - sizeMB) * 1024 * 1024
 	allowedRows := int(freeBytes / rowSizeBytes)
 	if allowedRows == 0 {
-		//time.Sleep(100 * time.Millisecond)
 		return
 	}
 
@@ -167,18 +165,8 @@ func (lg *LoadGen) randomDelete(ctx context.Context) {
 		return
 	}
 
-	// Perform VACUUM operation
-	//if sizeMB > lg.maxSizeMB+20 {
-	_, err = lg.pool.Exec(ctx, "VACUUM FULL test")
-	//if err != nil {
-	//fmt.Println("error performing VACUUM FULL:", err)
-	//}
-	//} else {
-	//_, err = lg.pool.Exec(ctx, "VACUUM test")
-	//if err != nil {
-	//fmt.Println("error performing VACUUM:", err)
-	//}
-	//}
+	lg.pool.Exec(ctx, "VACUUM test")
+	
 }
 
 // randomUpdate выполняет обновления, но контролирует, чтобы не превысить maxSizeMB
@@ -192,8 +180,6 @@ func (lg *LoadGen) randomUpdate(ctx context.Context) {
 	}
 
 	if sizeMB >= lg.maxSizeMB {
-		// слишком близко к максимуму – пропускаем обновление
-		//time.Sleep(50 * time.Millisecond)
 		return
 	}
 
