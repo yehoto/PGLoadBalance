@@ -110,7 +110,7 @@ services:
     ports:
       - "2112:2112"
     environment:
-      - DSN=postgres://${POSTGRES_USER}@master:5432/${POSTGRES_DB}?sslmode=disable #TODO: SSL
+      - DSN=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@master:5432/${POSTGRES_DB}?sslmode=disable
     depends_on:
       master:
         condition: service_healthy
