@@ -167,7 +167,12 @@ func (lg *LoadGen) randomDelete(ctx context.Context) {
 			removableRows = 5000
 		}
 		_, _ = lg.pool.Exec(ctx, fmt.Sprintf("DELETE FROM test WHERE id IN (SELECT id FROM test TABLESAMPLE SYSTEM (10) LIMIT %d)", removableRows))
-		_, _ = lg.pool.Exec(ctx, "VACUUM FULL test") // гарантированное сокращение файла
+		if (sizeMB>lg.maxSizeMB+20){
+           _, _ = lg.pool.Exec(ctx, "VACUUM FULL test") 
+		}else{
+			_, _ = lg.pool.Exec(ctx, "VACUUM test") 
+		}
+		 
 		sizeMB, _ = lg.mon.GetDBSize()
 		return sizeMB, nil
 	}
