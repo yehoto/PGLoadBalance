@@ -36,7 +36,7 @@ services:
     container_name: pg_phys_replica
     restart: unless-stopped
     environment:
-      PGUSER: ${REPLICATOR_USER}  # Use env vars
+      PGUSER: ${REPLICATOR_USER}
       PGPASSWORD: ${REPLICATOR_PASS}
     depends_on:
       master:
@@ -45,17 +45,18 @@ services:
       - "5433:5432"
     command: >
       bash -c "
-        until pg_basebackup -h master -p 5432 -D $$PGDATA \
-              U replicator R -X stream -C -S phys_slot; do
-          echo 'waiting for master...'; sleep 1;
+        until pg_basebackup -h master -p 5432 -D $$PGDATA -U replicator -R -X stream -C -S phys_slot; do
+          echo 'waiting for master...'; sleep 2;
         done;
+        echo \"primary_conninfo='host=master port=5432 user=replicator password=replicator_pass'\" >> $$PGDATA/postgresql.conf;
+        echo \"primary_slot_name='phys_slot'\" >> $$PGDATA/postgresql.conf;
         postgres -c hot_standby=on
       "
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"] #Or replicate user if desired.
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
     networks:
       - my-docker-network
 
@@ -63,8 +64,10 @@ services:
     image: postgres:17
     container_name: pg_logic_replica
     restart: unless-stopped
+    volumes:
+     - pg_logic_replica_data:/var/lib/postgresql/data
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}  #Use env vars
+      POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       PGUSER: ${REPLICATOR_USER}
       PGPASSWORD: ${REPLICATOR_PASS}
@@ -75,18 +78,23 @@ services:
       - "5434:5432"
     command: >
       bash -c "
-        until pg_basebackup -h master -p 5432 -D $$PGDATA \
-              U replicator R -X stream; do
-          echo 'waiting for master...'; sleep 1;
+        chmod 700 /var/lib/postgresql/data;
+        until gosu postgres pg_basebackup -h master -p 5432 -D /var/lib/postgresql/data -U replicator -X stream; do
+          echo 'waiting for master...'; sleep 2;
         done;
-        echo \"wal_level=logical\" >> $$PGDATA/postgresql.conf;
-        postgres
+        gosu postgres postgres &
+        until gosu postgres pg_isready -U postgres; do
+          echo 'waiting for server to start...'; sleep 2;
+        done;
+        gosu postgres psql -c \"CREATE SUBSCRIPTION logic_sub CONNECTION 'host=master port=5432 user=replicator password=replicator_pass' PUBLICATION my_publication WITH (copy_data = false);\"
+        wait $!
       "
+
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
     networks:
       - my-docker-network
 
@@ -145,11 +153,12 @@ services:
       - my-docker-network
 
 networks:
-  my-docker-network:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.18.0.0/16
+    my-docker-network:
+      driver: bridge
+      ipam:
+        driver: default
+        config:
+          - subnet: "172.18.0.0/16"
 volumes:
   pg_master_data:
   pg_phys_replica_data:

@@ -13,9 +13,15 @@ END $$;
 GRANT SELECT ON pg_replication_slots TO replicator;
 ALTER USER replicator WITH SUPERUSER;
 
--- Configure pg_hba.conf using shell commands
-\! echo "host replication replicator 172.18.0.0/16 scram-sha-256" >> /var/lib/postgresql/data/pg_hba.conf
-\! echo "host all all 172.18.0.0/16 scram-sha-256" >> /var/lib/postgresql/data/pg_hba.conf
+CREATE PUBLICATION my_publication FOR ALL TABLES;
+
+-- Configure pg_hba.conf using SQL
+CREATE TEMP TABLE hba_temp (line text);
+INSERT INTO hba_temp VALUES 
+  ('host replication replicator 172.18.0.0/16 scram-sha-256'),
+  ('host all all 172.18.0.0/16 scram-sha-256');
+COPY hba_temp TO '/var/lib/postgresql/data/pg_hba.conf';
+DROP TABLE hba_temp;
 
 -- Reload configuration
 SELECT pg_reload_conf();
