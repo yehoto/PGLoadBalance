@@ -9,11 +9,11 @@ URL: http://localhost:9090
 docker logs -f docker-loadgen-1
 
 ## запуск и остановка контейнеров
-docker-compose up -d
-docker volume rm pg_logic_replica_data
-docker volume rm pg_phys_replica_data
-docker volume rm pg_master_data
-docker volume create pg_logic_replica_data
-docker volume create pg_master_data
-docker volume create pg_phys_replica_data
-docker-compose down -v
+- docker-compose up -d
+- docker volume rm pg_logic_replica_data
+- docker volume rm pg_phys_replica_data
+- docker volume rm pg_master_data
+- docker volume create pg_logic_replica_data
+- docker volume create pg_master_data
+- docker volume create pg_phys_replica_data
+- docker-compose down -v
