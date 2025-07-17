@@ -51,9 +51,6 @@ func (lg *LoadGen) Run(ctx context.Context) {
 	}
 
 	// мониторинг размера и переключение режима
-	delta := lg.maxSizeMB - lg.minSizeMB
-	margin := delta / 10 // 10% диапазона 
-
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -71,23 +68,16 @@ func (lg *LoadGen) Run(ctx context.Context) {
 				lg.mode.Store(int32(insertMode))
 			} else if size >= lg.maxSizeMB {
 				lg.mode.Store(int32(deleteMode))
-			} else {
-				high := lg.maxSizeMB - margin
-				low := lg.minSizeMB + margin
-				if size >= high {
-					lg.mode.Store(int32(deleteMode))
-				} else if size <= low {
-					lg.mode.Store(int32(insertMode))
-				} else {
-					lg.mode.Store(int32(updateMode))
-				}
+			} else { // режим  рандомно
+				modes := []int32{int32(insertMode), int32(deleteMode), int32(updateMode)}
+				lg.mode.Store(modes[rand.Intn(len(modes))])
 			}
+
 		}
 	}
 }
 
 func (lg *LoadGen) worker(ctx context.Context) {
-	rand.Seed(time.Now().UnixNano())
 	for {
 		select {
 		case <-ctx.Done():
@@ -119,7 +109,7 @@ func (lg *LoadGen) batchInsert(ctx context.Context) {
 
 	// если уже упёрлись в максимум – выходим
 	if sizeMB >= lg.maxSizeMB {
-		time.Sleep(100 * time.Millisecond)
+		//time.Sleep(100 * time.Millisecond)
 		return
 	}
 
@@ -127,7 +117,7 @@ func (lg *LoadGen) batchInsert(ctx context.Context) {
 	freeBytes := (lg.maxSizeMB - sizeMB) * 1024 * 1024
 	allowedRows := int(freeBytes / rowSizeBytes)
 	if allowedRows == 0 {
-		time.Sleep(100 * time.Millisecond)
+		//time.Sleep(100 * time.Millisecond)
 		return
 	}
 
@@ -149,47 +139,46 @@ func (lg *LoadGen) randomDelete(ctx context.Context) {
 	lg.sizeMu.Lock()
 	defer lg.sizeMu.Unlock()
 
-	adjust := func() (int64, error) {
-		sizeMB, err := lg.mon.GetDBSize()
-		if err != nil {
-			return 0, err
-		}
-		if sizeMB <= lg.minSizeMB {
-			return sizeMB, nil
-		}
-		targetMB := (lg.minSizeMB + lg.maxSizeMB) / 2 // пытаемся довести до середины диапазона
-		removableBytes := (sizeMB - targetMB) * 1024 * 1024
-		removableRows := int(removableBytes / rowSizeBytes)
-		if removableRows < 1 {
-			removableRows = 1
-		}
-		if removableRows > 5000 {
-			removableRows = 5000
-		}
-		_, _ = lg.pool.Exec(ctx, fmt.Sprintf("DELETE FROM test WHERE id IN (SELECT id FROM test TABLESAMPLE SYSTEM (10) LIMIT %d)", removableRows))
-		if (sizeMB>lg.maxSizeMB+20){
-           _, _ = lg.pool.Exec(ctx, "VACUUM FULL test") 
-		}else{
-			_, _ = lg.pool.Exec(ctx, "VACUUM test") 
-		}
-		 
-		sizeMB, _ = lg.mon.GetDBSize()
-		return sizeMB, nil
+	sizeMB, err := lg.mon.GetDBSize()
+	if err != nil {
+		fmt.Println("error getting DB size:", err) // Log the error
+		return
 	}
 
-	for {
-		cur, err := adjust()
-		if err != nil {
-			return
-		}
-		if cur <= lg.maxSizeMB && cur >= lg.minSizeMB {
-			break
-		}
-		if cur < lg.minSizeMB {
-			// недолет – вернёмся в рабочий режим вставки
-			break
-		}
+	// Если база данных уже меньше минимального размера, выходим.
+	if sizeMB <= lg.minSizeMB {
+		return
 	}
+
+	targetMB := (lg.minSizeMB + lg.maxSizeMB) / 2 // пытаемся довести до середины диапазона
+	removableBytes := (sizeMB - targetMB) * 1024 * 1024
+	removableRows := int(removableBytes / rowSizeBytes)
+
+	if removableRows < 1 {
+		removableRows = 1
+	}
+	if removableRows > 5000 {
+		removableRows = 5000
+	}
+
+	_, err = lg.pool.Exec(ctx, fmt.Sprintf("DELETE FROM test WHERE id IN (SELECT id FROM test TABLESAMPLE SYSTEM (10) LIMIT %d)", removableRows))
+	if err != nil {
+		fmt.Println("error deleting rows:", err)
+		return
+	}
+
+	// Perform VACUUM operation
+	//if sizeMB > lg.maxSizeMB+20 {
+	_, err = lg.pool.Exec(ctx, "VACUUM FULL test")
+	//if err != nil {
+	//fmt.Println("error performing VACUUM FULL:", err)
+	//}
+	//} else {
+	//_, err = lg.pool.Exec(ctx, "VACUUM test")
+	//if err != nil {
+	//fmt.Println("error performing VACUUM:", err)
+	//}
+	//}
 }
 
 // randomUpdate выполняет обновления, но контролирует, чтобы не превысить maxSizeMB
@@ -204,7 +193,7 @@ func (lg *LoadGen) randomUpdate(ctx context.Context) {
 
 	if sizeMB >= lg.maxSizeMB {
 		// слишком близко к максимуму – пропускаем обновление
-		time.Sleep(50 * time.Millisecond)
+		//time.Sleep(50 * time.Millisecond)
 		return
 	}
 
