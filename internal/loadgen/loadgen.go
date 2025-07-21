@@ -7,9 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
 	"PGLoadBalance/internal/monitoring"
-
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -23,34 +21,54 @@ const (
 )
 
 type LoadGen struct {
-	pool      *pgxpool.Pool
-	mon       *monitoring.Monitoring
-	minSizeMB int64
-	maxSizeMB int64
-	mode      atomic.Int32 // текущий режим работы
-	workers   int
-	sizeMu    sync.Mutex // чтобы избежать гонок при расчёте объёма
+	pool           *pgxpool.Pool
+	mon            *monitoring.Monitoring
+	minSizeMB      int64
+	maxSizeMB      int64
+	mode           atomic.Int32
+	workers        int
+	numTables      int
+	estimatedSize  atomic.Int64 // Оценка размера базы данных
 }
 
-// средний размер одной строки в байтах (10 KB) – используется для точного контроля объёма
-const rowSizeBytes int64 = 10 * 1024
+// Средний размер строки (10 КБ данных + ~24 байта заголовка)
+const rowSizeBytes int64 = 10*1024 + 24
 
-func New(pool *pgxpool.Pool, mon *monitoring.Monitoring, minSize, maxSize int64, workers int) *LoadGen {
-	lg := &LoadGen{pool: pool, mon: mon, minSizeMB: minSize, maxSizeMB: maxSize, workers: workers}
+func New(pool *pgxpool.Pool, mon *monitoring.Monitoring, minSize, maxSize int64, workers, numTables int) *LoadGen {
+	lg := &LoadGen{
+		pool:           pool,
+		mon:            mon,
+		minSizeMB:      minSize,
+		maxSizeMB:      maxSize,
+		workers:        workers,
+		numTables:      numTables,
+	}
 	lg.mode.Store(int32(insertMode))
 	return lg
 }
 
 func (lg *LoadGen) Run(ctx context.Context) {
-	// ensure table exists
-	_, _ = lg.pool.Exec(ctx, "CREATE TABLE IF NOT EXISTS test (id bigserial PRIMARY KEY, data text)")
-
-	// запускаем воркеры
-	for i := 0; i < lg.workers; i++ {
-		go lg.worker(ctx)
+	// Создание таблиц и отключение autovacuum
+	for i := 1; i <= lg.numTables; i++ {
+		table := fmt.Sprintf("test_%d", i)
+		lg.pool.Exec(ctx, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (id bigserial PRIMARY KEY, data text)", table))
+		lg.pool.Exec(ctx, fmt.Sprintf("ALTER TABLE %s SET (autovacuum_enabled = off)", table))
 	}
 
-	// мониторинг размера и переключение режима
+	// Привязка каждого потока к таблице
+	var wg sync.WaitGroup
+	for i := 0; i < lg.workers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			tableID := (workerID % lg.numTables) + 1
+			table := fmt.Sprintf("test_%d", tableID)
+			lg.worker(ctx, table)
+		}(i)
+	}
+
+
+	// Мониторинг размера и переключение режима
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -60,125 +78,96 @@ func (lg *LoadGen) Run(ctx context.Context) {
 		case <-ticker.C:
 			size, err := lg.mon.GetDBSize()
 			if err != nil {
-				fmt.Println("monitor error:", err)
+				fmt.Println("Ошибка мониторинга:", err)
 				continue
 			}
 			fmt.Printf("Current DB size: %d MB\n", size)
-			if size <= lg.minSizeMB {
+			lg.estimatedSize.Store(size)
+			if size <= lg.minSizeMB+20 {
 				lg.mode.Store(int32(insertMode))
-			} else if size >= lg.maxSizeMB {
+			} else if size >= lg.maxSizeMB-20 {
 				lg.mode.Store(int32(deleteMode))
-			} else { // режим  рандомно
+			} else {
 				modes := []int32{int32(insertMode), int32(deleteMode), int32(updateMode)}
 				lg.mode.Store(modes[rand.Intn(len(modes))])
 			}
-
 		}
 	}
 }
 
-func (lg *LoadGen) worker(ctx context.Context) {
+func (lg *LoadGen) worker(ctx context.Context, table string) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-		}
-		currentMode := modeEnum(lg.mode.Load())
-		switch currentMode {
-		case insertMode:
-			lg.batchInsert(ctx)
-		case deleteMode:
-			lg.randomDelete(ctx)
-		case updateMode:
-			lg.randomUpdate(ctx)
+			currentMode := modeEnum(lg.mode.Load())
+			switch currentMode {
+			case insertMode:
+				lg.batchInsert(ctx, table)
+			case deleteMode:
+				lg.randomDelete(ctx, table)
+			case updateMode:
+				lg.randomUpdate(ctx, table)
+			}
 		}
 	}
 }
 
-// batchInsert вставляет до 100 строк, но гарантирует, что после вставки объём не превысит maxSizeMB.
-func (lg *LoadGen) batchInsert(ctx context.Context) {
-	lg.sizeMu.Lock()
-	defer lg.sizeMu.Unlock()
-
-	// узнаём актуальный размер
-	sizeMB, err := lg.mon.GetDBSize()
-	if err != nil {
-		return // при ошибке просто пропустим попытку, попробуем позже
-	}
-
-	// если уже упёрлись в максимум – выходим
+func (lg *LoadGen) batchInsert(ctx context.Context, table string) {
+	sizeMB := lg.estimatedSize.Load()
 	if sizeMB >= lg.maxSizeMB {
 		return
 	}
 
-	// сколько байт ещё можем добавить, чтобы не превысить maxSizeMB
 	freeBytes := (lg.maxSizeMB - sizeMB) * 1024 * 1024
 	allowedRows := int(freeBytes / rowSizeBytes)
 	if allowedRows == 0 {
 		return
 	}
-
-	// не более 100 строк за батч, но и не больше, чем позволяет лимит
 	if allowedRows > 100 {
 		allowedRows = 100
 	}
 
 	batch := &pgx.Batch{}
 	for i := 0; i < allowedRows; i++ {
-		batch.Queue("INSERT INTO test(data) VALUES($1)", randString(int(rowSizeBytes)))
+		batch.Queue(fmt.Sprintf("INSERT INTO %s(data) VALUES($1)", table), randString(int(rowSizeBytes)))
 	}
 	br := lg.pool.SendBatch(ctx, batch)
 	_ = br.Close()
 }
 
-// randomDelete удаляет строки так, чтобы не опуститься ниже minSizeMB
-func (lg *LoadGen) randomDelete(ctx context.Context) {
-	lg.sizeMu.Lock()
-	defer lg.sizeMu.Unlock()
-
-	sizeMB, err := lg.mon.GetDBSize()
-	if err != nil {
-		fmt.Println("error getting DB size:", err) // Log the error
-		return
-	}
-
-	// Если база данных уже меньше минимального размера, выходим.
+func (lg *LoadGen) randomDelete(ctx context.Context, table string) {
+	sizeMB := lg.estimatedSize.Load()
 	if sizeMB <= lg.minSizeMB {
 		return
 	}
 
-	targetMB := (lg.minSizeMB + lg.maxSizeMB) / 2 // пытаемся довести до середины диапазона
+	targetMB := (lg.minSizeMB + lg.maxSizeMB) / 2
+	if sizeMB <= targetMB {
+		return // Не удаляем, если размер уже ниже или равен целевому
+	}
+
 	removableBytes := (sizeMB - targetMB) * 1024 * 1024
 	removableRows := int(removableBytes / rowSizeBytes)
-
 	if removableRows < 1 {
-		removableRows = 1
+		return
 	}
 	if removableRows > 5000 {
 		removableRows = 5000
 	}
 
-	_, err = lg.pool.Exec(ctx, fmt.Sprintf("DELETE FROM test WHERE id IN (SELECT id FROM test TABLESAMPLE SYSTEM (10) LIMIT %d)", removableRows))
+	_, err := lg.pool.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE id IN (SELECT id FROM %s TABLESAMPLE SYSTEM (10) LIMIT %d)", table, table, removableRows))
 	if err != nil {
-		fmt.Println("error deleting rows:", err)
 		return
 	}
 
-	lg.pool.Exec(ctx, "VACUUM test")
+		lg.checkAndVacuum(ctx, table)
 	
 }
 
-// randomUpdate выполняет обновления, но контролирует, чтобы не превысить maxSizeMB
-func (lg *LoadGen) randomUpdate(ctx context.Context) {
-	lg.sizeMu.Lock()
-	defer lg.sizeMu.Unlock()
-
-	sizeMB, err := lg.mon.GetDBSize()
-	if err != nil {
-		return
-	}
-
+func (lg *LoadGen) randomUpdate(ctx context.Context, table string) {
+	sizeMB := lg.estimatedSize.Load()
 	if sizeMB >= lg.maxSizeMB {
 		return
 	}
@@ -192,7 +181,26 @@ func (lg *LoadGen) randomUpdate(ctx context.Context) {
 		allowedRows = 100
 	}
 
-	_, _ = lg.pool.Exec(ctx, fmt.Sprintf("UPDATE test SET data = $1 WHERE id IN (SELECT id FROM test TABLESAMPLE SYSTEM (1) LIMIT %d)", allowedRows), randString(int(rowSizeBytes)))
+	_, err := lg.pool.Exec(ctx, fmt.Sprintf("UPDATE %s SET data = $1 WHERE id IN (SELECT id FROM %s TABLESAMPLE SYSTEM (1) LIMIT %d)", table, table, allowedRows), randString(int(rowSizeBytes)))
+	if err != nil {
+		return
+	}
+
+	
+		lg.checkAndVacuum(ctx, table)
+	
+}
+
+func (lg *LoadGen) checkAndVacuum(ctx context.Context, table string) {
+	var dead int64
+	err := lg.pool.QueryRow(ctx, "SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname=$1", table).Scan(&dead)
+	if err != nil {
+		return
+	}
+	const threshold = 3000 // Сниженный порог для более частого запуска VACUUM
+	if dead > threshold {
+		lg.pool.Exec(ctx, fmt.Sprintf("VACUUM %s", table))
+	}
 }
 
 func randString(n int) string {
