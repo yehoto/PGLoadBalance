@@ -47,6 +47,7 @@ func New(pool *pgxpool.Pool, mon *monitoring.Monitoring, minSize, maxSize int64)
 }
 
 func (lg *LoadGen) Run(ctx context.Context) {
+    // lg.initPartitioning(ctx)
 	// Create table with no_hot column to disable HOT updates
 	_, err := lg.pool.Exec(ctx,
 		fmt.Sprintf(`
@@ -90,6 +91,7 @@ lg.pool.Exec(ctx, fmt.Sprintf(
 			}
 
             log.Printf("DB: %d\n", szy)
+                lg.checkMaintenance(ctx)
 
             sz := lg.tableLenBytes.Load() / (1024 * 1024) // Конвертируем байты в мегабайты
 
@@ -124,7 +126,7 @@ lg.pool.Exec(ctx, fmt.Sprintf(
 }
 
 func (lg *LoadGen) batchInsert(ctx context.Context) error {
-    lg.checkMaintenance(ctx)
+
     // Получаем текущий размер таблицы в байтах
     currentSizeBytes := lg.tableLenBytes.Load()
     maxSizeBytes := lg.maxSizeMB * 1024 * 1024
@@ -183,7 +185,7 @@ func (lg *LoadGen) batchInsert(ctx context.Context) error {
 }
 
 func (lg *LoadGen) randomDelete(ctx context.Context) error {
-    lg.checkMaintenance(ctx)
+
 	freeBits := lg.countEmptyTuples.Load()
 	//avgLenTuples := lg.avgTupleLen.Load()
 	deadTupleBytes := lg.deadTupleBytes.Load()
@@ -201,10 +203,11 @@ func (lg *LoadGen) randomDelete(ctx context.Context) error {
      availableToDeleteBytes := int(availableToDeleteBytesFloat)
 
 
-    if ((lg.minSizeMB*1024*1024) >= (deadTupleBytes+freeBits)) ||((lg.minSizeMB*1024*1024) <= (deadTupleBytes+freeBits)) {
-        availableToDeleteBytes =  1000 -  int(lg.countDeadTuples.Load())//1000 ЭТО ПОРОГ ДЛЯ ДЭД VACUUM чтобы не зацикливалось
-        log.Printf("ААААААААААААААААААААААААААААААААААа")
-    } else if availableToDeleteBytes <= 0 {
+    // if ((lg.minSizeMB*1024*1024) >= (deadTupleBytes+freeBits)) {
+    //     availableToDeleteBytes =  1000 -  int(lg.countDeadTuples.Load())//1000 ЭТО ПОРОГ ДЛЯ ДЭД VACUUM чтобы не зацикливалось
+    //     log.Printf("ААААААААААААААААААААААААААААААААААа")
+    //} else 
+    if availableToDeleteBytes <= 0 {
 		availableToDeleteBytes = 0
 	} else  if availableToDeleteBytes >= 5000 {
 		availableToDeleteBytes = 5000
@@ -232,50 +235,48 @@ func (lg *LoadGen) randomDelete(ctx context.Context) error {
 }
 
 func (lg *LoadGen) batchUpdate(ctx context.Context) error {
-    lg.checkMaintenance(ctx)
-    
-    // Получаем текущую статистику
     freeBytes := lg.countEmptyTuples.Load()
-    avgTupleSize := lg.avgTupleLen.Load()
-    if avgTupleSize == 0 {
-        avgTupleSize = 1024 // консервативная оценка
-    }
-    
+    avgTupleSize := 1024
+   
+
     // Получаем количество живых строк
     var liveTupleCount int64
-    err := lg.pool.QueryRow(ctx, 
-        fmt.Sprintf("SELECT count(*) FROM %s", lg.tableName)).Scan(&liveTupleCount)
-    if err != nil {
+    if err := lg.pool.QueryRow(ctx,
+        fmt.Sprintf("SELECT count(*) FROM %s", lg.tableName)).
+        Scan(&liveTupleCount); err != nil {
         return fmt.Errorf("failed to get live tuple count: %w", err)
     }
-    
-    // Рассчитываем максимальное количество строк для обновления
-    rowsBySpace := freeBytes / avgTupleSize
+
+    // Рассчитываем ограничения
+    rowsBySpace := freeBytes / int64 (avgTupleSize)
     rowsByLive := liveTupleCount
-    
-    // Берем минимальное из двух значений
     maxRows := rowsBySpace
     if rowsByLive < maxRows {
         maxRows = rowsByLive
     }
-    
-    // Если нет доступных строк или места - выходим
-    if maxRows <= 0 {
-        return nil
-    }
-    
-    // Ограничиваем размер пакета
-    if maxRows >= 5000 {
+    if maxRows > 5000 {
         maxRows = 5000
     }
-    
-    // Выбираем случайное количество строк для обновления
+
+    // Диагностический лог
+    log.Printf(
+        "batchUpdate diagnostics — freeBytes=%d avgTupleSize=%d liveTuples=%d -> maxRows=%d",
+        freeBytes, avgTupleSize, liveTupleCount, maxRows,
+    )
+
+    if maxRows <= 0 {
+        log.Printf("batchUpdate: no work to do (maxRows=%d)", maxRows)
+        return nil
+    }
+
     rowsToUpdate := int(maxRows)
     if rowsToUpdate > 1 {
         rowsToUpdate = lg.rand.Intn(rowsToUpdate) + 1
     }
-    
-    // Выполняем обновление
+
+    // Ещё один лог-пристрел перед Exec
+    log.Printf("batchUpdate: going to update %d rows", rowsToUpdate)
+
     res, err := lg.pool.Exec(ctx,
         fmt.Sprintf(`
             UPDATE %s 
@@ -285,17 +286,25 @@ func (lg *LoadGen) batchUpdate(ctx context.Context) error {
                 ORDER BY random() 
                 LIMIT %d
             )`,
-            lg.tableName, lg.tableName, rowsToUpdate),
-        randString(1024, lg.rand), // новые данные
+            lg.tableName, lg.tableName, rowsToUpdate,
+        ),
+        randString(1024, lg.rand),
     )
     if err != nil {
-        return fmt.Errorf("update failed: %w", err)
+        log.Printf("batchUpdate: Exec failed: %v", err)
+        return err
     }
-    
+
     affected := res.RowsAffected()
-    log.Printf("Updated rows: %d", affected)
+    log.Printf("Requested to update: %d, actually updated: %d", rowsToUpdate, affected)
+
+    if affected == 0 {
+        log.Printf("batchUpdate: zero rows updated — возможно, таблица пуста или нет подходящих id")
+    }
+
     return nil
 }
+
 
 func (lg *LoadGen) checkMaintenance(ctx context.Context) {
 	tupBytes, deadCount, deadBytes, freeBytes, err := lg.getPgstattupleStats(ctx)
@@ -330,133 +339,23 @@ func (lg *LoadGen) checkMaintenance(ctx context.Context) {
         // Сохраняем метрики
         // currentSize := lg.tableLenBytes.Load()
         // reclaimable := deadBytes + freeBytes
-        // rangeSize := (lg.maxSizeMB - lg.minSizeMB) * 1024 * 1024
-        // minSizeBytes := lg.minSizeMB * 1024 * 1024
-
-        // То что ниже почти никогда не случается но на пожарный
-     // Условие 1: reclaimable > 80% от таблицы
-    //  if float64(reclaimable) > 0.8*float64(rangeSize){
-    //     // Проверяем, не опустимся ли ниже минимума после очистки
-    //     if currentSize - reclaimable >= minSizeBytes {
-
-    //          log.Printf("Trigger VACUUM FULL: reclaimable=%dMB (%.1f%% of range)",
-    //             reclaimable/(1024*1024), 100*float64(reclaimable)/float64(rangeSize))
-            
-    //         if _, err := lg.pool.Exec(ctx, fmt.Sprintf("VACUUM FULL %s", lg.tableName)); err != nil {
-    //             log.Printf("VACUUM FULL failed: %v", err)
-    //         }
-    //     } else {
-    //         log.Printf("Trigger VACUUM + refill: reclaimable=%dMB, but after FULL would be below min", reclaimable/(1024*1024))
-    //             // 1. Сначала обычный VACUUM
-    //         if _, err := lg.pool.Exec(ctx, fmt.Sprintf("VACUUM %s", lg.tableName)); err != nil {
-    //             log.Printf("VACUUM failed: %v", err)
-    //         }
-
-    //          tupBytes, deadCount, deadBytes, freeBytes, err := lg.getPgstattupleStats(ctx)
-    //                 if err != nil {
-    //                     log.Printf("pgstattuple failed: %v", err)
-    //                     return
-    //                 }
-
-    //                 lg.avgTupleLen.Store(tupBytes)
-    //                 lg.countDeadTuples.Store(deadCount)
-    //                 lg.countEmptyTuples.Store(freeBytes)
-    //                 lg.deadTupleBytes.Store(deadBytes)
-
-    //                    currentSize := lg.tableLenBytes.Load()
-    //                     reclaimable := deadBytes + freeBytes
-    //                   //  rangeSize := (lg.maxSizeMB - lg.minSizeMB) * 1024 * 1024
-    //                     minSizeBytes := lg.minSizeMB * 1024 * 1024
-
-
-    //         // 2. Рассчитываем сколько нужно вставить до безопасного уровня
-    //         safeThreshold := currentSize - reclaimable//до этого уровня можно подняться
-    //         bytesNeeded := minSizeBytes - safeThreshold
-
-    //         /*100 300 50 130 100+50*/
-    //         /* cur-recl(d+f)*/
-    //         /*min-cur*/
-
-    //          // 3. Вставляем данные порциями
-    //         for bytesNeeded > 0 {
-    //             select {
-    //             case <-ctx.Done():
-    //                 return
-    //             default:
-    //                 inserted, err := lg.insertBatchUntilSafe(ctx, bytesNeeded)
-    //                 if err != nil {
-    //                     log.Printf("refill insert failed: %v", err)
-    //                     break
-    //                 }
-    //                 bytesNeeded -= inserted
-                    
-                
-    //                 // Обновляем статистику после вставки
-    //                 tupBytes, deadCount, deadBytes, freeBytes, err := lg.getPgstattupleStats(ctx)
-    //                 if err != nil {
-    //                     log.Printf("pgstattuple failed: %v", err)
-    //                     return
-    //                 }
-
-    //                 lg.avgTupleLen.Store(tupBytes)
-    //                 lg.countDeadTuples.Store(deadCount)
-    //                 lg.countEmptyTuples.Store(freeBytes)
-    //                 lg.deadTupleBytes.Store(deadBytes)
-
-    //                if (lg.tableLenBytes.Load() - lg.deadTupleBytes.Load() - lg.countEmptyTuples.Load()) >= (lg.maxSizeMB*1024*1024) {
-    //                  return
-    //                   }
-    //         }
-            
-    //         // 4. Теперь можно безопасно выполнить VACUUM FULL
-    //         log.Printf("Trigger VACUUM FULL after refill")
-    //         if _, err := lg.pool.Exec(ctx, fmt.Sprintf("VACUUM FULL %s", lg.tableName)); err != nil {
-    //             log.Printf("VACUUM FULL failed: %v", err)
-    //         }
-    //     }
-    
-
-    //     }
-    // }
-
+         // VACUUM FULL, если освободилось слишком много места
+        rangeSize := (lg.maxSizeMB - lg.minSizeMB) * 1024 * 1024
+        if float64(rangeSize)*0.8 <= float64(freeBytes) {
+        // Сначала удаляем живые строки до minSizeMB
+        if err := lg.preVacuumDelete(ctx, tupBytes); err != nil {
+            log.Printf("preVacuumDelete error: %v", err)
+        }
+        // Потом VACUUM FULL
+        if _, err := lg.pool.Exec(ctx, fmt.Sprintf("VACUUM FULL %s", lg.tableName)); err != nil {
+            log.Printf("VACUUM FULL failed: %v", err)
+        } else {
+            log.Printf("VACUUM FULL executed")
+        }
+    }
 
 
 }
-
-    func (lg *LoadGen) insertBatchUntilSafe(ctx context.Context, bytesNeeded int64) (int64, error) {
-     
-        // Рассчитываем размер пакета
-        avgSize := lg.avgTupleLen.Load()
-        if avgSize == 0 {
-            avgSize = 1024
-        }
-        
-        rowsToInsert := int(bytesNeeded / avgSize)
-        if rowsToInsert == 0 {
-            rowsToInsert = 1
-        }
-        if rowsToInsert > 500 {
-            rowsToInsert = 500
-        }
-        
-        // Выполняем вставку
-        batch := &pgx.Batch{}
-        for i := 0; i < rowsToInsert; i++ {
-            batch.Queue(
-                fmt.Sprintf("INSERT INTO %s(data) VALUES($1)", lg.tableName),
-                randString(1024, lg.rand),
-            )
-        }
-        
-        if err := lg.pool.SendBatch(ctx, batch).Close(); err != nil {
-            return 0, fmt.Errorf("refill insert failed: %w", err)
-        }
-        
-        insertedBytes := int64(rowsToInsert) * avgSize
-        log.Printf("Refill insert: %d rows (~%dMB)", rowsToInsert, insertedBytes/(1024*1024))
-        return insertedBytes, nil
- }
-
    
 
 
@@ -518,4 +417,43 @@ func (lg *LoadGen) getPgstattupleStats(ctx context.Context) (
 	lg.tableLenBytes.Store(tableLen)
 
 	return tupleLenBytes, deadCount, deadLenBytes, freeSpaceBytes, nil
+}
+
+
+// Добавляем метод для предварительного удаления живых строк
+func (lg *LoadGen) preVacuumDelete(ctx context.Context, liveBytes int64) error {
+    // Сколько байт нужно убрать, чтобы остаться в minSizeMB
+    minSizeBytes := lg.minSizeMB * 1024 * 1024
+    bytesToRemove := liveBytes - minSizeBytes
+    if bytesToRemove <= 0 {
+        return nil
+    }
+
+    // Оценка среднего размера кортежа
+    avgTupleSize := lg.avgTupleLen.Load()
+    if avgTupleSize == 0 {
+        avgTupleSize = 1024
+    }
+
+    rowsToDelete := int(bytesToRemove / avgTupleSize)
+    if rowsToDelete <= 0 {
+        return nil
+    }
+    if rowsToDelete > 5000 {
+        rowsToDelete = 5000
+    }
+
+    // Удаляем самые старые записи по id
+    delRes, err := lg.pool.Exec(ctx,
+        fmt.Sprintf(
+            "DELETE FROM %s WHERE id IN (SELECT id FROM %s ORDER BY id LIMIT %d)",
+            lg.tableName, lg.tableName, rowsToDelete,
+        ),
+    )
+    if err != nil {
+        return fmt.Errorf("pre-VACUUM delete failed: %w", err)
+    }
+    deleted := delRes.RowsAffected()
+    log.Printf("Deleted %d live rows before VACUUM FULL", deleted)
+    return nil
 }
