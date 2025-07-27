@@ -11,6 +11,7 @@ scrape_configs:
   - job_name: 'postgres_phys'
     static_configs:
       - targets: ['pg_exporter_phys:9187']
-  - job_name: 'postgres_logic'
+
+  - job_name: 'node'
     static_configs:
-      - targets: ['pg_exporter_logic:9187']
+      - targets: ['node_exporter:9100']

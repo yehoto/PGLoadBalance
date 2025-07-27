@@ -1,24 +1,21 @@
-# syntax=docker/dockerfile:1
-
+# === Сборка Go-бинаря ===
 FROM golang:1.23 AS builder
-
 WORKDIR /app
 
-# Кэшируем зависимости
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Копируем остальной исходный код
 COPY . .
-
-# Сборка статического бинаря
 RUN CGO_ENABLED=0 GOOS=linux go build -o loadgen ./cmd/loadgen
 
-# Используем минимальный distroless-образ
-FROM gcr.io/distroless/static
+# === Итоговый образ для loadgen ===
+FROM postgres:17
+
+# Устанавливаем только то, что нужно для вызова pg_repack (запускается в контейнере loadgen)
+RUN apt-get update \
+    && apt-get install -y postgresql-17-repack \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/loadgen /loadgen
 
-# По умолчанию запускаем генератор; параметры можно
-# переопределить в docker-compose через command: []
-ENTRYPOINT ["/loadgen"] 
+ENTRYPOINT ["/loadgen"]

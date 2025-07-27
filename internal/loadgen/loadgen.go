@@ -340,7 +340,7 @@ func (lg *LoadGen) checkMaintenance(ctx context.Context) {
 
  
     rangeSize := (lg.maxSizeMB - lg.minSizeMB) * 1024 * 1024
-    if float64(rangeSize)*0.2 <= float64(freeBytes) {
+    if float64(rangeSize)*0.8 <= float64(freeBytes) {
         log.Printf("checkMaintenance: запуск предварительной очистки")
         
         // Вызов с ЛОГИРОВАНИЕМ
