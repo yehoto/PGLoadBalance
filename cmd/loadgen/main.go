@@ -4,42 +4,42 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
 	"PGLoadBalance/internal/config"
 	"PGLoadBalance/internal/loadgen"
 	"PGLoadBalance/internal/monitoring"
-	"PGLoadBalance/internal/postgres"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
-	configPath := flag.String("config", "config.yaml", "Путь к файлу конфигурации")
-	minSize := flag.Int64("min-size", 100, "Минимальный размер базы данных в МБ")
-	maxSize := flag.Int64("max-size", 300, "Максимальный размер базы данных в МБ")
-	workers := flag.Int("workers", 16, "Количество воркеров")
-	numTables := flag.Int("tables", 4, "Количество тестовых таблиц")
+	configPath := flag.String("config", "config.yaml", "Path to configuration file")
+	minSize := flag.Int64("min-size", 100, "Minimum database size in MB")
+	maxSize := flag.Int64("max-size", 300, "Maximum database size in MB")
+	tableName := flag.String("table", "test", "Table name for load generation")
 	flag.Parse()
 
-	// Проверка параметров
 	if *minSize >= *maxSize {
-		fmt.Println("Ошибка: min-size должен быть меньше max-size")
-		os.Exit(1)
-	}
-	if *numTables < 1 {
-		fmt.Println("Ошибка: tables должно быть >= 1")
+		fmt.Println("Error: min-size must be less than max-size")
 		os.Exit(1)
 	}
 
 	// Загрузка конфигурации
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		fmt.Printf("Ошибка загрузки конфигурации: %v\n", err)
+		fmt.Printf("Error loading configuration: %v\n", err)
 		os.Exit(1)
 	}
 
 	// Создание пула соединений
-	pool, err := postgres.ConnectPool(cfg.Postgres.DSN, 50)
+	pool, err := pgxpool.New(context.Background(), cfg.Postgres.DSN)
 	if err != nil {
-		fmt.Printf("Ошибка подключения к БД: %v\n", err)
+		fmt.Printf("Error connecting to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer pool.Close()
@@ -47,8 +47,31 @@ func main() {
 	// Инициализация мониторинга
 	mon := monitoring.New(pool)
 
-	// Создание и запуск генератора нагрузки
-	lg := loadgen.New(pool, mon, *minSize, *maxSize, *workers, *numTables)
+	// Создание расширения pgstattuple
 	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS pgstattuple`); err != nil {
+		log.Printf("Warning: failed to create pgstattuple extension: %v", err)
+	}
+
+	// Создание генератора нагрузки
+	lg := loadgen.New(pool, mon, *minSize, *maxSize)
+
+	// Настройка graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Обработка сигналов завершения
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+		fmt.Println("\nShutting down gracefully...")
+		cancel()
+		time.Sleep(1 * time.Second)
+	}()
+
+	// Запуск генерации нагрузки
+	log.Printf("Starting load generator for table %q (min=%dMB, max=%dMB)", *tableName, *minSize, *maxSize)
 	lg.Run(ctx)
+	log.Println("Load generator stopped")
 }
