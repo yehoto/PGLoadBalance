@@ -2,9 +2,10 @@
 
 services:
   master:
-    build:
-      context: .
-      dockerfile: master.Dockerfile
+    image: postgres:17
+    # build:
+    #   context: .
+    #   dockerfile: master.Dockerfile
     # image: postgres:17
     container_name: pg_master
     restart: unless-stopped
@@ -39,40 +40,6 @@ services:
            aliases:
             - repl_master        # для реплики
 
-  # phys_replica:
-  #   image: postgres:17
-  #   container_name: pg_phys_replica
-  #   volumes:
-  #     - pg_phys_replica_data:/var/lib/postgresql/data
-  #   restart: unless-stopped
-  #   environment:
-  #     PGUSER: ${REPLICATOR_USER}
-  #     PGPASSWORD: ${REPLICATOR_PASS}
-  #   depends_on:
-  #     master:
-  #       condition: service_healthy
-  #   ports:
-  #     - "5433:5432"
-  #   command: >
-  #     bash -c "
-  #       rm -rf $$PGDATA/*;
-  #       chmod 700 $$PGDATA;
-  #       until gosu postgres pg_basebackup -h master -p 5432 -D $$PGDATA -U replicator -R -X stream; do
-  #         echo 'waiting for master...'; sleep 2;
-  #       done;
-  #       echo \"primary_conninfo='host=master port=5432 user=replicator password=replicator_pass'\" >> $$PGDATA/postgresql.conf;
-  #       echo \"primary_slot_name='phys_slot'\" >> $$PGDATA/postgresql.conf;
-  #       exec gosu postgres postgres -c hot_standby=on
-  #     "
-
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "pg_isready -U postgres"]
-  #     interval: 5s
-  #     timeout: 5s
-  #     retries: 10
-  #   networks:
-  #     - my-docker-network
-
   phys_replica:
     image: postgres:17
     container_name: pg_phys_replica
@@ -97,6 +64,10 @@ services:
         done;
         echo \"primary_conninfo='host=repl_master port=5432 user=replicator password=replicator_pass'\" >> $$PGDATA/postgresql.conf;
         echo \"primary_slot_name='phys_slot'\" >> $$PGDATA/postgresql.conf;
+      # параметры для каскадной репликации 
+        echo \"max_wal_senders = 10\" >> $$PGDATA/postgresql.conf;
+        echo \"hot_standby_feedback = on\" >> $$PGDATA/postgresql.conf;
+        echo \"wal_level = replica\" >> $$PGDATA/postgresql.conf;
       fi;
       exec gosu postgres postgres -c hot_standby=on
        "
@@ -104,14 +75,15 @@ services:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 12
+      start_period: 30s
     networks:
       my-docker-network:
         aliases:
           - pg_phys_replica
       replication_net:
         aliases:
-          - repl_phys_replica  # алиас в приватке
+          - repl_phys_replica
 
   pg_exporter_phys:
     image: prometheuscommunity/postgres-exporter:latest
@@ -142,7 +114,6 @@ services:
     image: prom/prometheus:latest
     volumes:
       - ./prometheus.yml/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      #- ./prometheus.yml/rules.pg.yml:/etc/prometheus/rules.pg.yml:ro
     ports:
       - "9090:9090"
     networks:
@@ -174,38 +145,57 @@ services:
     networks:
       - my-docker-network
 
-  # pg_exporter_phys:
-  #   image: prometheuscommunity/postgres-exporter:latest
-  #   environment:
-  #     - DATA_SOURCE_NAME=postgresql://${REPLICATOR_USER}:${REPLICATOR_PASS}@phys_replica:5432/${POSTGRES_DB}?sslmode=disable #TODO: SSL
-  #   depends_on:
-  #     phys_replica:
-  #       condition: service_healthy
-  #   networks:
-  #     - my-docker-network
+  cascade_replica:
+    image: postgres:17
+    container_name: pg_cascade_replica
+    volumes:
+      - pg_cascade_replica_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    environment:
+      PGUSER: ${REPLICATOR_USER}
+      PGPASSWORD: ${REPLICATOR_PASS}
+    depends_on:
+      phys_replica:
+        condition: service_healthy
+    ports:
+      - "5434:5432"
+    command: >
+        bash -c "
+        if [ ! -f $$PGDATA/postgresql.conf ]; then
+          rm -rf $$PGDATA/*;
+          chmod 700 $$PGDATA;
+          until gosu postgres pg_basebackup -h repl_phys_replica -p 5432 -D $$PGDATA -U replicator -R -X stream --no-slot; do
+            echo 'waiting for phys_replica...'; sleep 2;
+          done;
+          # Удаляем упоминание слота
+          sed -i '/primary_slot_name/d' $$PGDATA/postgresql.conf
+        fi;
+        exec gosu postgres postgres -c hot_standby=on
+        "
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      my-docker-network:
+        aliases:
+          - pg_cascade_replica
+      replication_net:
+        aliases:
+          - repl_cascade_replica
 
-  # pg_exporter_logic:
-  #   image: prometheuscommunity/postgres-exporter:latest
-  #   environment:
-  #     - DATA_SOURCE_NAME=postgresql://${REPLICATOR_USER}:${REPLICATOR_PASS}@logic_replica:5432/${POSTGRES_DB}?sslmode=disable #TODO: SSL
-  #   depends_on:
-  #     logic_replica:
-  #       condition: service_healthy
-  #   networks:
-  #     - my-docker-network
-
-# networks:
-#     my-docker-network:
-#       driver: bridge
-#       ipam:
-#         driver: default
-#         config:
-#           - subnet: "172.18.0.0/16"
-#      # Внешняя сеть для репликации
-#     replication_net:
-#       external: true
-#       name: replication_net
-
+  pg_exporter_cascade:
+    image: prometheuscommunity/postgres-exporter:latest
+    environment:
+      - DATA_SOURCE_NAME=postgresql://${REPLICATOR_USER}:${REPLICATOR_PASS}@cascade_replica:5432/${POSTGRES_DB}?sslmode=disable
+    depends_on:
+      cascade_replica:
+        condition: service_healthy
+    networks:
+      - my-docker-network
+  
 networks:
   my-docker-network:
     driver: bridge
@@ -216,10 +206,10 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: "10.5.0.0/16"  # Уникальная подсеть для репликации
+        - subnet: "10.5.0.0/16"  
 
 volumes:
   pg_master_data:
   pg_phys_replica_data:
-  # pg_logic_replica_data:
   grafana_data:
+  pg_cascade_replica_data:

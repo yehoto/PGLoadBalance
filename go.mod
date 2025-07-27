@@ -6,6 +6,7 @@ toolchain go1.24.1
 
 require (
 	github.com/jackc/pgx/v5 v5.7.5
+	github.com/thanhpk/randstr v1.0.6
 	gopkg.in/yaml.v3 v3.0.1
 )
 

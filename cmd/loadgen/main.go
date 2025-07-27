@@ -10,11 +10,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"PGLoadBalance/internal/config"
 	"PGLoadBalance/internal/loadgen"
 	"PGLoadBalance/internal/monitoring"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {

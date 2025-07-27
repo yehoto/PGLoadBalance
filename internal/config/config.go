@@ -8,29 +8,37 @@ import (
 )
 
 type Config struct {
-	Postgres struct {
-		DSN string `yaml:"dsn"`
-	} `yaml:"postgres"`
+	Postgres PostgresConfig `yaml:"postgres"`
+}
+
+type PostgresConfig struct {
+	DSN string `yaml:"dsn"`
 }
 
 func Load(path string) (*Config, error) {
 	cfg := &Config{}
 
-	// Попытка прочитать YAML-конфиг
-	if data, err := os.ReadFile(path); err == nil {
-		if err := yaml.Unmarshal(data, cfg); err != nil {
-			return nil, err
+	data, err := os.ReadFile(path)
+	if err != nil {
+
+		if os.IsNotExist(err) {
+
+		} else {
+
+			return nil, fmt.Errorf("error reading config file: %w", err)
 		}
-	} else if !os.IsNotExist(err) { // любая ошибка, кроме «файл не найден»
-		return nil, err
+	} else {
+
+		err = yaml.Unmarshal(data, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing YAML config: %w", err)
+		}
 	}
 
-	// Приоритет у переменной окружения DSN
 	if envDSN := os.Getenv("DSN"); envDSN != "" {
 		cfg.Postgres.DSN = envDSN
 	}
 
-	// Проверяем, что DSN задан
 	if cfg.Postgres.DSN == "" {
 		return nil, fmt.Errorf("DSN is not set: config file %s missing or empty and environment variable DSN is not provided", path)
 	}
