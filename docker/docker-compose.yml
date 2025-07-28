@@ -3,10 +3,6 @@
 services:
   master:
     image: postgres:17
-    # build:
-    #   context: .
-    #   dockerfile: master.Dockerfile
-    # image: postgres:17
     container_name: pg_master
     restart: unless-stopped
     environment:
