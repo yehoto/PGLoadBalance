@@ -19,9 +19,9 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
-	minSize := flag.Int64("min-size", 100, "Minimum database size in MB")
-	maxSize := flag.Int64("max-size", 300, "Maximum database size in MB")
-	tablesCount := flag.Int("tables", 4, "Number of tables to use for load generation")
+	minSize := flag.Int64("min-size", 100 , "Minimum database size in MB")
+	maxSize := flag.Int64("max-size", 200 , "Maximum database size in MB")
+	tablesCount := flag.Int("tables", 1 , "Number of tables to use for load generation")
 	flag.Parse()
 
 	if *minSize >= *maxSize {
