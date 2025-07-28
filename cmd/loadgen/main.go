@@ -21,7 +21,7 @@ func main() {
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
 	minSize := flag.Int64("min-size", 100, "Minimum database size in MB")
 	maxSize := flag.Int64("max-size", 300, "Maximum database size in MB")
-	tableName := flag.String("table", "test", "Table name for load generation")
+	tablesCount := flag.Int("tables", 4, "Number of tables to use for load generation")
 	flag.Parse()
 
 	if *minSize >= *maxSize {
@@ -47,14 +47,8 @@ func main() {
 	// Инициализация мониторинга
 	mon := monitoring.New(pool)
 
-	// Создание расширения pgstattuple
-	ctx := context.Background()
-	if _, err := pool.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS pgstattuple`); err != nil {
-		log.Printf("Warning: failed to create pgstattuple extension: %v", err)
-	}
-
 	// Создание генератора нагрузки
-	lg := loadgen.New(pool, mon, *minSize, *maxSize)
+	lg := loadgen.New(pool, mon, *minSize, *maxSize, *tablesCount)
 
 	// Настройка graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -71,7 +65,8 @@ func main() {
 	}()
 
 	// Запуск генерации нагрузки
-	log.Printf("Starting load generator for table %q (min=%dMB, max=%dMB)", *tableName, *minSize, *maxSize)
+	log.Printf("Starting load generator with %d tables (min=%dMB, max=%dMB)",
+		*tablesCount, *minSize, *maxSize)
 	lg.Run(ctx)
 	log.Println("Load generator stopped")
 }

@@ -5,14 +5,16 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-    "github.com/thanhpk/randstr"
+	"github.com/thanhpk/randstr"
 
 	"PGLoadBalance/internal/monitoring"
+    "PGLoadBalance/internal/queries"
 
 )
 
@@ -25,54 +27,81 @@ const (
 	updateMode
 )
 
-type LoadGen struct {
-	pool             *pgxpool.Pool
-	mon              *monitoring.Monitor
-	minSizeMB        int64
-	maxSizeMB        int64
-	tableName        string
-	rand             *rand.Rand
+type TableState struct {
+	name             string
 	emptyTuplesBytes atomic.Int64
 	liveTupleBytes   atomic.Int64
 	deadTupleBytes   atomic.Int64
-	totalRelSize     atomic.Int64
-	delta            atomic.Int64 // общий объём бд - totalRelSIze
+	rand             *rand.Rand
 }
 
-func New(pool *pgxpool.Pool, mon *monitoring.Monitor, minSize, maxSize int64) *LoadGen {
+type LoadGen struct {
+	pool      *pgxpool.Pool
+	mon       *monitoring.Monitor
+	minSizeMB int64
+	maxSizeMB int64
+	tables    []*TableState
+	wg        sync.WaitGroup
+}
+
+func New(pool *pgxpool.Pool, mon *monitoring.Monitor, minSize, maxSize int64, tablesCount int) *LoadGen {
+	tables := make([]*TableState, tablesCount)
+	for i := 0; i < tablesCount; i++ {
+		tables[i] = &TableState{
+			name: fmt.Sprintf("test_%d", i),
+			rand: rand.New(rand.NewSource(time.Now().UnixNano() + int64(i))),
+		}
+	}
 	return &LoadGen{
 		pool:      pool,
 		mon:       mon,
 		minSizeMB: minSize,
 		maxSizeMB: maxSize,
-		tableName: "test",
-		rand:      rand.New(rand.NewSource(time.Now().UnixNano())),
+		tables:    tables,
 	}
 }
 
 func (lg *LoadGen) Run(ctx context.Context) {
-	_, err := lg.pool.Exec(ctx,
-		fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %s (
-			id bigserial PRIMARY KEY,
-			data text
-		)`, lg.tableName))
+    _, err := lg.pool.Exec(ctx, queries.CreateExtensionPgstattuple)
 	if err != nil {
-		log.Printf("Failed to create table: %v", err)
-		return
-	}
-	_, err = lg.pool.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS pgstattuple`)
-	if err != nil {
-		log.Printf("Failed to create pgstattuple extension: %v", err)
+		log.Printf("Failed to create extension: %v", err)
 	}
 
-	lg.pool.Exec(ctx, fmt.Sprintf(
-		`ALTER TABLE %s 
-		SET (
-			autovacuum_enabled = off,
-			toast.autovacuum_enabled = off
-		)`, lg.tableName))
+	for _, table := range lg.tables {
+		_, err := lg.pool.Exec(ctx, queries.CreateTable(table.name))
+		if err != nil {
+			log.Printf("Failed to create table %s: %v", table.name, err)
+			return
+		}
+        _, err = lg.pool.Exec(ctx, queries.DisableAutovacuum(table.name))
+                if err != nil {
+                    log.Printf("Failed to disable autovacuum: %v", err)
+                }
+		
+	}
 
+	 // Запуск горутин для каждой таблицы с интервалом
+    for i, table := range lg.tables {
+        lg.wg.Add(1)
+        go func(t *TableState) {
+            defer lg.wg.Done()
+            lg.runTable(ctx, t)
+        }(table)
+
+        // Добавляем задержку между запуском горутин
+        if i < len(lg.tables)-1 {
+            select {
+            case <-time.After(500 * time.Millisecond):
+            case <-ctx.Done():
+                return
+            }
+        }
+    }
+
+	lg.wg.Wait()
+}
+
+func (lg *LoadGen) runTable(ctx context.Context, table *TableState) {
 	ticker := time.NewTicker(333 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -81,39 +110,55 @@ func (lg *LoadGen) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			dbSizeMB, err := lg.mon.GetDBSize()
+             lg.observer(ctx, table)
+			
+		}
+	}
+}
+
+func (lg *LoadGen) observer(ctx context.Context, table *TableState) {
+    // Получение размера БД
+    dbSizeMB, err := lg.mon.GetDBSize()
 			if err != nil {
 				log.Printf("Failed to get DB size: %v", err)
-				continue
+			}
+	
+			// Распределение общего размера БД по таблицам
+			n := int64(len(lg.tables))
+			dbSizePerTable := (dbSizeMB * 1024 * 1024 )/ n
+		
+			// Добавление остатка к первой таблице
+			if table == lg.tables[0] {
+				remainder := (dbSizeMB * 1024 * 1024) % n
+				dbSizePerTable += remainder
 			}
 
-			log.Printf("DB: %d\n", dbSizeMB)
-            
-
-			// Получаем и сохраняем общий размер таблицы
-			var totalSize int64
-			err = lg.pool.QueryRow(ctx,
-				"SELECT pg_total_relation_size($1)",
-				lg.tableName,
-			).Scan(&totalSize)
-			if err != nil {
-				log.Printf("Error to get totalsize")
-
-			}
-			lg.totalRelSize.Store(totalSize)
-			log.Printf("TOTALSIZE: %d", totalSize)
-			lg.delta.Store(dbSizeMB*1024*1024 - lg.totalRelSize.Load())
-			lg.checkMaintenance(ctx)
+			lg.checkMaintenance(ctx, table)
 
 			mode := insertMode
 
-			if dbSizeMB >= lg.maxSizeMB {
+			delta := (dbSizePerTable - lg.getTablePhysicalSize(table) )
+			minSizeBytes := ((lg.minSizeMB * 1024 * 1024) / n) + delta
+			maxSizeBytes := ((lg.maxSizeMB * 1024 * 1024) / n) - delta
+
+			if table == lg.tables[0] {
+						remainder1 := (lg.minSizeMB * 1024 * 1024) % n
+						remainder2 := (lg.maxSizeMB * 1024 * 1024) % n
+						minSizeBytes += remainder1
+						maxSizeBytes += remainder2
+					}
+
+			  totalTableSize, err := lg.mon.GetTableSize(ctx, table.name)
+			if err != nil {
+				log.Printf("Failed to get DB size: %v", err)
+			}		
+             hysteresisBytes := int64(float64(maxSizeBytes - minSizeBytes) * 0.1)//10% от диапазона
+			if  totalTableSize -  hysteresisBytes >= maxSizeBytes {
 				mode = deleteMode
-			} else if dbSizeMB <= lg.minSizeMB {
+			} else if  totalTableSize +  hysteresisBytes<= minSizeBytes {
 				mode = insertMode
 			} else {
-
-				switch lg.rand.Intn(3) {
+				switch table.rand.Intn(3) {
 				case 0:
 					mode = insertMode
 				case 1:
@@ -125,291 +170,163 @@ func (lg *LoadGen) Run(ctx context.Context) {
 
 			switch mode {
 			case insertMode:
-				lg.batchInsert(ctx)
+				lg.batchInsert(ctx, table, maxSizeBytes)
 			case deleteMode:
-				lg.randomDelete(ctx)
+				lg.randomDelete(ctx, table, minSizeBytes)
 			case updateMode:
-				lg.batchUpdate(ctx)
+				lg.batchUpdate(ctx, table, maxSizeBytes,minSizeBytes)
 			}
-		}
-	}
 }
 
-func (lg *LoadGen) batchInsert(ctx context.Context) error {
+func (lg *LoadGen) getTablePhysicalSize(table *TableState) int64 {
+    return table.liveTupleBytes.Load() + table.deadTupleBytes.Load() + table.emptyTuplesBytes.Load()
+}
 
-	// Получаем текущий размер таблицы в байтах
-	currentSizeBytes := lg.totalRelSize.Load() + lg.delta.Load()
-	maxSizeBytes := lg.maxSizeMB * 1024 * 1024
+func (lg *LoadGen) batchInsert(
+	ctx context.Context,
+	table *TableState,
+	maxSizeBytes int64,
+) error {
 
-	if maxSizeBytes <= currentSizeBytes {
+	if maxSizeBytes <= lg.getTablePhysicalSize(table) {
+		log.Printf("NO INSERT maxSizeBytes <= currentSizeBytes")
 		return nil
 	}
-	// Рассчитываем доступное пространство
-	freeSpaceBytes := maxSizeBytes - currentSizeBytes + lg.emptyTuplesBytes.Load()
 
+	freeSpaceBytes := maxSizeBytes - lg.getTablePhysicalSize(table) + table.emptyTuplesBytes.Load()
 	if freeSpaceBytes <= 0 {
-		log.Println("No space available for insert")
+		log.Printf("[%s] No space available for insert", table.name)
 		return nil
 	}
 
-	// Рассчитываем максимальное количество строк для вставки
 	maxInsertRows := int(freeSpaceBytes / avgTupleLen)
-	log.Printf("maxInsertrows: %d", maxInsertRows)
 	if maxInsertRows <= 0 {
+		log.Printf("NO INSERT maxInsertRows <= 0 ")
 		return nil
 	}
 
-	// Ограничиваем размер пакета
 	if maxInsertRows > 5000 {
 		maxInsertRows = 5000
 	}
+	log.Printf("MAXINSERTROWS %d ", maxInsertRows)
 
-	// Генерируем случайное количество строк (от 1 до maxInsertRows)
 	rowsToInsert := 1
 	if maxInsertRows > 1 {
-		rowsToInsert = lg.rand.Intn(maxInsertRows) + 1
+		rowsToInsert = table.rand.Intn(maxInsertRows) + 1
 	}
 
 	batch := &pgx.Batch{}
 	for i := 0; i < rowsToInsert; i++ {
-		batch.Queue(
-			fmt.Sprintf("INSERT INTO %s(data) VALUES($1)", lg.tableName),
-			randstr.String(1024), // Генерируем строку 1KB
-		)
+		batch.Queue(queries.Insert(table.name), randstr.String(1024))
 	}
 
 	if err := lg.pool.SendBatch(ctx, batch).Close(); err != nil {
-		return fmt.Errorf("batch insert failed: %w", err)
+		return fmt.Errorf("batch insert failed for %s: %w", table.name, err)
 	}
 
-	log.Printf("Inserted rows: %d", rowsToInsert)
+	log.Printf("[%s] Inserted rows: %d", table.name, rowsToInsert)
 	return nil
-
 }
 
-func (lg *LoadGen) randomDelete(ctx context.Context) error {
+func (lg *LoadGen) randomDelete(
+	ctx context.Context,
+	table *TableState,
+	minSizeBytes int64,
+) error {
 
-	currentSize := lg.totalRelSize.Load() + lg.delta.Load()
+	toDeleteBytes := lg.getTablePhysicalSize(table) - minSizeBytes - table.deadTupleBytes.Load() - table.emptyTuplesBytes.Load()
 
-	toDeleteBytesInt64 := currentSize - (lg.minSizeMB * 1024 * 1024) - lg.deadTupleBytes.Load() - lg.emptyTuplesBytes.Load()
+	toDeleteTuples := int(toDeleteBytes / avgTupleLen)
 
-	toDeleteTuplesFloat := float64(toDeleteBytesInt64) / float64(avgTupleLen)
-	toDeleteTuples := int(toDeleteTuplesFloat)
-
+	log.Printf("TODELETETUPLRS %d", toDeleteTuples)
 	if toDeleteTuples <= 0 {
 		toDeleteTuples = 0
-	} else if toDeleteTuples >= 5000 {
+	} else if toDeleteTuples > 5000 {
 		toDeleteTuples = 5000
 	}
 
-	rowsToDelete := lg.rand.Intn(int(toDeleteTuples) + 1)
-	if rowsToDelete == 0 {
+	if toDeleteTuples == 0 {
 		return nil
 	}
 
-	res, err := lg.pool.Exec(ctx,
-		fmt.Sprintf("DELETE FROM %s WHERE id IN (SELECT id FROM %s ORDER BY id LIMIT %d)",
-			lg.tableName, lg.tableName, rowsToDelete),
-	)
+	rowsToDelete := table.rand.Intn(toDeleteTuples) + 1
+	query := queries.Delete(table.name, rowsToDelete)
+	res, err := lg.pool.Exec(ctx, query)
 	if err != nil {
-		return fmt.Errorf("delete failed: %w", err)
+		return fmt.Errorf("delete failed for %s: %w", table.name, err)
 	}
 
-	affected := res.RowsAffected()
-
-	log.Printf("Deleted rows: %d", affected)
-
+	log.Printf("[%s] Deleted rows: %d", table.name, res.RowsAffected())
 	return nil
 }
 
-func (lg *LoadGen) batchUpdate(ctx context.Context) error {
-	freeBytes := lg.emptyTuplesBytes.Load()
+func (lg *LoadGen) batchUpdate(ctx context.Context, table *TableState, maxSizeBytes int64, minSizeBytes int64) error {
+	// меньшее между строк что можно удалить и добавить
+	freeSpaceBytes := maxSizeBytes - lg.getTablePhysicalSize(table) + table.emptyTuplesBytes.Load()
 
-	// Получаем количество живых строк
-	var liveTupleCount int64
-	if err := lg.pool.QueryRow(ctx,
-		fmt.Sprintf("SELECT count(*) FROM %s", lg.tableName)).
-		Scan(&liveTupleCount); err != nil {
-		return fmt.Errorf("failed to get live tuple count: %w", err)
+	maxInsertRows := int(freeSpaceBytes / avgTupleLen)
+	toDeleteBytes := lg.getTablePhysicalSize(table) - minSizeBytes - table.deadTupleBytes.Load() - table.emptyTuplesBytes.Load()
+
+	toDeleteTuples := int(toDeleteBytes / avgTupleLen)
+
+
+	minRows := maxInsertRows
+	 if toDeleteTuples < minRows {
+		minRows = toDeleteTuples
+	 }
+
+	if minRows > 500 {
+		minRows = 500
 	}
 
-	// Рассчитываем ограничения
-	rowsBySpace := freeBytes / int64(avgTupleLen)
-	rowsByLive := liveTupleCount
-	maxRows := rowsBySpace
-	if rowsByLive < maxRows {
-		maxRows = rowsByLive
-	}
-
-	maxRows = maxRows + ((lg.liveTupleBytes.Load() / avgTupleLen) / 2)
-	if maxRows > 5000 {
-		maxRows = 5000
-	}
-
-	// Диагностический лог
-	log.Printf(
-		"batchUpdate diagnostics — freeBytes=%d avgTupleSize=%d liveTuples=%d -> maxRows=%d",
-		freeBytes, avgTupleLen, liveTupleCount, maxRows,
-	)
-
-	if maxRows <= 0 {
-		log.Printf("batchUpdate: no work to do (maxRows=%d)", maxRows)
+	if minRows <= 0 {
 		return nil
 	}
 
-	rowsToUpdate := int(maxRows)
+
+	rowsToUpdate := int(minRows)
 	if rowsToUpdate > 1 {
-		rowsToUpdate = lg.rand.Intn(rowsToUpdate) + 1
+		rowsToUpdate = table.rand.Intn(rowsToUpdate) + 1
 	}
 
-	// Ещё один лог-пристрел перед Exec
-	log.Printf("batchUpdate: going to update %d rows", rowsToUpdate)
-
-	// Упрощенный UPDATE без no_hot
-	res, err := lg.pool.Exec(ctx,
-		fmt.Sprintf(`
-            UPDATE %s 
-            SET data = $1
-            WHERE id IN (
-                SELECT id FROM %s 
-                ORDER BY random() 
-                LIMIT %d
-            )`,
-			lg.tableName, lg.tableName, rowsToUpdate,
-		),
-		randstr.String(1024),
-	)
+	query := queries.Update(table.name, rowsToUpdate)
+	res, err := lg.pool.Exec(ctx, query, randstr.String(1024))
 	if err != nil {
-		log.Printf("batchUpdate: Exec failed: %v", err)
-		return err
+		return fmt.Errorf("update failed for %s: %w", table.name, err)
 	}
 
-	affected := res.RowsAffected()
-	log.Printf("Requested to update: %d, actually updated: %d", rowsToUpdate, affected)
-
-	if affected == 0 {
-		log.Printf("batchUpdate: zero rows updated — возможно, таблица пуста или нет подходящих id")
-	}
-
+	log.Printf("[%s] Updated rows: %d", table.name, res.RowsAffected())
 	return nil
 }
 
-func (lg *LoadGen) checkMaintenance(ctx context.Context) {
-	tupBytes, deadBytes, freeBytes, err := lg.getPgstattupleStats(ctx)
+func (lg *LoadGen) checkMaintenance(ctx context.Context, table *TableState) {
+	tupBytes, deadBytes, freeBytes, err := lg.mon.GetPgstattupleStats(ctx, table.name)
 	if err != nil {
-		log.Printf("pgstattuple failed: %v", err)
+		log.Printf("[%s] pgstattuple failed: %v", table.name, err)
 		return
 	}
-	lg.liveTupleBytes.Store(tupBytes)
-	lg.emptyTuplesBytes.Store(freeBytes)
-	lg.deadTupleBytes.Store(deadBytes)
-
-	log.Printf(
-		"LiveTupleBytes=%dB, DeadBytes=%dB, FreeBytes=%dB",
-		tupBytes,
-		deadBytes,
-		freeBytes,
-	)
+	table.liveTupleBytes.Store(tupBytes)
+	table.emptyTuplesBytes.Store(freeBytes)
+	table.deadTupleBytes.Store(deadBytes)
 
 	if deadBytes/avgTupleLen >= 1000 {
-		log.Printf("Trigger manual VACUUM: dead tuples=%d", deadBytes)
-		if _, err := lg.pool.Exec(ctx, fmt.Sprintf("VACUUM %s", lg.tableName)); err != nil {
-			log.Printf("VACUUM failed: %v", err)
-		}
+		log.Printf("[%s] Trigger manual VACUUM", table.name)
+        lg.pool.Exec(ctx, queries.Vacuum(table.name))
 	}
 
-	rangeSize := (lg.maxSizeMB - lg.minSizeMB) * 1024 * 1024
+	n := int64(len(lg.tables))
+	rangeSize := (lg.maxSizeMB - lg.minSizeMB) * 1024 * 1024 / n
 	if float64(rangeSize)*0.8 <= float64(freeBytes) {
-		log.Printf("checkMaintenance: запуск предварительной очистки")
-
-		// VACUUM FULL
-		if _, err := lg.pool.Exec(ctx, fmt.Sprintf("VACUUM FULL %s", lg.tableName)); err != nil {
-			log.Printf("VACUUM FULL failed: %v", err)
-		} else {
-			log.Printf("VACUUM FULL выполнен")
-			// обновление статистики
-			tupBytes, deadBytes, freeBytes, err := lg.getPgstattupleStats(ctx)
-			if err != nil {
-				log.Printf("pgstattuple failed: %v", err)
-				return
-			}
-			lg.liveTupleBytes.Store(tupBytes)
-			lg.emptyTuplesBytes.Store(freeBytes)
-			lg.deadTupleBytes.Store(deadBytes)
-
-			log.Printf(
-				"LiveTupleBytes=%dB, DeadBytes=%dB, FreeBytes=%dB",
-				tupBytes,
-				deadBytes,
-				freeBytes,
-			)
-			dbSizeMB, err := lg.mon.GetDBSize()
-			if err != nil {
-				log.Printf("Failed to get DB size: %v", err)
-			}
-
-			log.Printf("DB: %d\n", dbSizeMB)
-
-			// Получаем и сохраняем общий размер таблицы
-			var totalSize int64
-			err = lg.pool.QueryRow(ctx,
-				"SELECT pg_total_relation_size($1)",
-				lg.tableName,
-			).Scan(&totalSize)
-			if err != nil {
-				log.Printf("AAAAAAAAAAAA")
-
-			}
-			lg.totalRelSize.Store(totalSize)
-			log.Printf("TOTAL: %d", totalSize)
-			lg.delta.Store(dbSizeMB*1024*1024 - lg.totalRelSize.Load())
-
-		}
+		log.Printf("[%s] Running VACUUM FULL", table.name)
+		lg.pool.Exec(ctx, queries.VacuumFull(table.name))
+		
+			// Обновление статистики после VACUUM FULL
+			tupBytes, deadBytes, freeBytes, _ := lg.mon.GetPgstattupleStats(ctx, table.name)
+	
+			table.liveTupleBytes.Store(tupBytes)
+			table.emptyTuplesBytes.Store(freeBytes)
+			table.deadTupleBytes.Store(deadBytes)
+		
 	}
 }
 
-func (lg *LoadGen) getPgstattupleStats(ctx context.Context) (
-	tupleLenBytes int64,
-	deadLenBytes int64,
-	freeSpaceBytes int64,
-	err error,
-) {
-
-	var tableLen int64
-	var deadCount int64
-	var localTupleCount int64
-	var tuplePct float64
-	var deadPct float64
-	var freePct float64
-
-	query := fmt.Sprintf(`
-        SELECT
-            table_len,
-            tuple_count,    
-            tuple_len,
-            tuple_percent,  
-            dead_tuple_count, 
-            dead_tuple_len,
-            dead_tuple_percent, 
-            free_space,
-            free_percent      
-        FROM pgstattuple('%s')`, lg.tableName)
-
-	err = lg.pool.QueryRow(ctx, query).Scan(
-		&tableLen,
-		&localTupleCount,
-		&tupleLenBytes,
-		&tuplePct,
-		&deadCount,
-		&deadLenBytes,
-		&deadPct,
-		&freeSpaceBytes,
-		&freePct,
-	)
-	if err != nil {
-
-		return 0, 0, 0, fmt.Errorf("pgstattuple scan failed: %w", err)
-	}
-
-	return tupleLenBytes, deadLenBytes, freeSpaceBytes, nil
-}
