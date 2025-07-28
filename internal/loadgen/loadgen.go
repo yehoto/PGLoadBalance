@@ -320,7 +320,6 @@ func (lg *LoadGen) checkMaintenance(ctx context.Context, table *TableState) {
 		log.Printf("[%s] Running VACUUM FULL", table.name)
 		lg.pool.Exec(ctx, queries.VacuumFull(table.name))
 		
-			// Обновление статистики после VACUUM FULL
 			tupBytes, deadBytes, freeBytes, _ := lg.mon.GetPgstattupleStats(ctx, table.name)
 	
 			table.liveTupleBytes.Store(tupBytes)
