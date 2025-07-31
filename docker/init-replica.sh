@@ -1,43 +1,32 @@
 #!/bin/bash
 set -e
 
-# Этот скрипт выполняется при первом запуске реплики
+echo "*************** Initializing Replica ***************"
 
-# Функция ожидания готовности primary
-wait_for_primary() {
-    echo "Waiting for primary database to be ready..."
-    until pg_isready -h postgres-primary -p 5432 -U "$POSTGRES_USER"; do
-        echo "Still waiting for primary..."
-        sleep 2
-    done
-    echo "Primary database is ready!"
-}
+# Ждем, пока primary будет готов принимать подключения
+sleep 10
 
-# Проверяем, существует ли уже кластер данных
-if [ ! -s "$PGDATA/PG_VERSION" ]; then
-    echo "*************** Initializing Replica from Primary ***************"
-    
-    wait_for_primary
+# Удаляем существующие данные реплики
+echo "Cleaning old data..."
+rm -rf ${PGDATA:?}/*
 
-    echo "Starting base backup..."
-    # Выполняем базовый бэкап с primary
-    pg_basebackup -h postgres-primary -D "$PGDATA" -U "$POSTGRES_USER" -vP --wal-method=stream --write-recovery-conf
+# Выполняем базовый бэкап с primary
+echo "Starting base backup from primary..."
+PGPASSWORD=${REPLICATOR_PASSWORD} pg_basebackup -h postgres-primary -D ${PGDATA} -U ${REPLICATOR_USER} --verbose --progress --wal-method=stream
 
-    # Создаем файл standby.signal для указания, что это standby сервер (для новых версий)
-    touch "$PGDATA/standby.signal"
+# Настраиваем подключение к primary в файле postgresql.conf реплики
+echo "Configuring replica connection to primary..."
+cat >> ${PGDATA}/postgresql.conf <<EOF
 
-    # Настраиваем параметры восстановления (для новых версий они идут в postgresql.auto.conf или standby.signal)
-    # Но мы можем явно указать их через команду запуска в docker-compose.yml
-    # или добавить в postgresql.conf
-    cat >> "$PGDATA/postgresql.conf" <<-EOL
+# --- Standby Configuration ---
+primary_conninfo = 'host=postgres-primary port=5432 user=${REPLICATOR_USER} password=${REPLICATOR_PASSWORD} application_name=replica1'
+# primary_slot_name = 'replica1_slot' # Убираем на время тестирования
+hot_standby = on
+# -----------------------------
+EOF
 
-# Recovery settings added by init-replica.sh
-primary_conninfo = 'host=postgres-primary port=5432 user=$POSTGRES_USER password=$POSTGRES_PASSWORD application_name=postgres-replica'
-restore_command = 'cp /var/lib/postgresql/data/archive/%f %p'
-recovery_target_timeline = 'latest'
-EOL
+# Создаем файл standby.signal
+echo "Creating standby.signal..."
+touch ${PGDATA}/standby.signal
 
-    echo "*************** Replica Initialization Complete ***************"
-else
-    echo "*************** Replica data directory already exists, skipping base backup ***************"
-fi
+echo "*************** Replica Initialized ***************"

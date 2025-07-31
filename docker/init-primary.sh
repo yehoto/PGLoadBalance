@@ -1,40 +1,59 @@
 #!/bin/bash
 set -e
 
-# Этот скрипт выполняется только один раз при первом запуске primary
-
 echo "*************** Configuring Primary Server ***************"
 
-# Создаем пользователя с правом репликации (если еще не создан)
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
-    CREATE USER replicator_user WITH REPLICATION ENCRYPTED PASSWORD '$POSTGRES_PASSWORD';
-    -- Создаем тестовую таблицу (опционально)
-    CREATE TABLE IF NOT EXISTS test_replication (id SERIAL PRIMARY KEY, data TEXT);
+# Создаем пользователя и базу данных
+psql -v ON_ERROR_STOP=1 --username "postgres" --dbname "postgres" <<-EOSQL
+    -- Создаем базу данных, если она еще не существует
+    SELECT 'CREATE DATABASE appdb' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'appdb');
+    -- Создаем пользователя репликации С ПРАВАМИ СУПЕРПОЛЬЗОВАТЕЛЯ
+    -- ВНИМАНИЕ: Это небезопасно для продакшена!
+    CREATE USER $REPLICATOR_USER WITH REPLICATION SUPERUSER ENCRYPTED PASSWORD '$REPLICATOR_PASSWORD';
+    -- Предоставляем привилегии для работы с БД appdb (теперь избыточно, так как superuser)
+    -- GRANT ALL PRIVILEGES ON DATABASE appdb TO $REPLICATOR_USER;
+    -- Назначаем роль pg_monitor для доступа к функциям мониторинга (полезно, но не обязательно для loadgen)
+    -- GRANT pg_monitor TO $REPLICATOR_USER;
 EOSQL
 
-# Настраиваем postgresql.conf
+# --- Добавляем создание репликационного слота ---
+echo "Creating replication slot 'replica1_slot'..."
+psql -v ON_ERROR_STOP=1 --username "postgres" --dbname "postgres" <<-EOSQL
+    SELECT 'CREATE_REPLICATION_SLOT replica1_slot PHYSICAL' WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica1_slot');
+    -- Или просто: SELECT pg_create_physical_replication_slot('replica1_slot');
+    -- Второй вариант проще и не требует проверки существования
+    -- Выберем второй вариант:
+EOSQL
+
+psql -v ON_ERROR_STOP=1 --username "postgres" --dbname "postgres" <<-EOSQL
+    SELECT pg_create_physical_replication_slot('replica1_slot');
+EOSQL
+# --- Конец добавления ---
+
+# Настраиваем postgresql.conf для репликации
 cat >> ${PGDATA}/postgresql.conf <<EOF
 
-# Custom config for replication
+# --- Replication config ---
 listen_addresses = '*'
 wal_level = replica
-max_wal_senders = 3
-wal_keep_size = 512MB
-archive_mode = on
-archive_command = 'cp %p /var/lib/postgresql/data/archive/%f'
+max_wal_senders = 10
 synchronous_commit = on
-synchronous_standby_names = '"postgres-replica"'
+synchronous_standby_names = 'replica1'
+# --------------------------
 EOF
 
-# Создаем каталог для архивации WAL
-mkdir -p ${PGDATA}/archive
+# Настраиваем pg_hba.conf для разрешения подключений
+cat > ${PGDATA}/pg_hba.conf <<EOF
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
 
-# Настраиваем pg_hba.conf
-cat >> ${PGDATA}/pg_hba.conf <<EOF
+# Разрешить локальные подключения через trust (для внутренних операций)
+local   all             all                                     trust
 
-# Replication settings
-host    replication     replicator_user    samenet    md5
-host    all             all                samenet    md5
+# Разрешить все подключения к любым БД через trust (для тестирования)
+host    all             all             all                     trust
+
+# ЯВНО разрешить репликацию для пользователя replicator с любого адреса через scram-sha-256
+host    replication     $REPLICATOR_USER  all                   scram-sha-256
 EOF
 
-echo "*************** Primary Server Configuration Complete ***************"
+echo "*************** Primary Configuration Complete ***************"

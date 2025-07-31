@@ -1,2 +1,2 @@
 postgres:
-  dsn: "postgres://postgres@127.0.0.1:5435/postgres?sslmode=disable" 
+  dsn: "postgres://replicator:replicator_pass@postgres-primary:5432/appdb?sslmode=disable" 
