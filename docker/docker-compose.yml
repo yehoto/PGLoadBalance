@@ -7,31 +7,22 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: your_super_secret_postgres_password
-      POSTGRES_DB: appdb
+      # Убираем POSTGRES_DB: appdb - используем postgres по умолчанию
       REPLICATOR_USER: replicator
       REPLICATOR_PASSWORD: replicator_pass
     volumes:
-        # --- Исправлено ---
-        # Старая строка (неправильная):
-        # - primary_/var/lib/postgresql/data
-        # Новая строка (правильная):
-        - primary_data:/var/lib/postgresql/data
-        # --- ---
-        - ./init-primary.sh:/docker-entrypoint-initdb.d/init-primary.sh
-      # ... (другие настройки сервиса) ..
+      - primary_data:/var/lib/postgresql/data
+      - ./init-primary.sh:/docker-entrypoint-initdb.d/init-primary.sh
     ports:
       - "5433:5432"
     networks:
       - postgres-replication
-    # --- Добавляем healthcheck ---
     healthcheck:
-      # Используем pg_isready для проверки готовности Postgres
-      test: ["CMD-SHELL", "pg_isready -U postgres -d appdb"]
-      interval: 5s      # Проверять каждые 5 секунд
-      timeout: 5s       # Таймаут для одной проверки
-      retries: 5        # Количество попыток перед тем, как считать unhealthy
-      start_period: 30s # Время ожидания перед первой проверкой (даем время на инициализацию)
-    # -----------------------------
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"] # <-- Изменено на postgres
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   postgres-replica:
     image: postgres:16
@@ -42,13 +33,8 @@ services:
       REPLICATOR_USER: replicator
       REPLICATOR_PASSWORD: replicator_pass
     volumes:
-        # --- Исправлено ---
-        # Старая строка (неправильная):
-        # - replica_/var/lib/postgresql/data
-        # Новая строка (правильная):
-        - replica_data:/var/lib/postgresql/data
-        # --- ---
-        - ./init-replica.sh:/docker-entrypoint-initdb.d/init-replica.sh
+      - replica_data:/var/lib/postgresql/data
+      - ./init-replica.sh:/docker-entrypoint-initdb.d/init-replica.sh
     ports:
       - "5434:5432"
     depends_on:
@@ -61,34 +47,31 @@ services:
       context: ..
       dockerfile: Dockerfile
     container_name: loadgen
-    # command: ["/loadgen", "-min-size", "100", "-max-size", "300"] # Убираем старую команду
-    # --- Обновляем command и depends_on ---
     command: ["/loadgen", "-min-size", "100", "-max-size", "300"]
     ports:
       - "2112:2112"
     environment:
-      DSN: "postgres://replicator:replicator_pass@postgres-primary:5432/appdb?sslmode=disable"
+      # <-- Изменено на postgres -->
+      DSN: "postgres://replicator:replicator_pass@postgres-primary:5432/postgres?sslmode=disable"
     depends_on:
       postgres-primary:
-        condition: service_healthy # <-- Вот ключевое изменение
+        condition: service_healthy
     networks:
       - postgres-replication
 
-
-  # Экспортеры - проверьте пароли
   pg_exporter_master:
     image: prometheuscommunity/postgres-exporter:latest
     environment:
-      # Убедитесь, что БД существует и пользователь имеет доступ
-      DATA_SOURCE_NAME: "postgresql://replicator:replicator_pass@postgres-primary:5432/appdb?sslmode=disable"
+      # <-- Изменено на postgres -->
+      DATA_SOURCE_NAME: "postgresql://replicator:replicator_pass@postgres-primary:5432/postgres?sslmode=disable"
     networks:
       - postgres-replication
 
   pg_exporter_replica:
     image: prometheuscommunity/postgres-exporter:latest
     environment:
-      # Убедитесь, что БД существует и пользователь имеет доступ
-      DATA_SOURCE_NAME: "postgresql://replicator:replicator_pass@postgres-replica:5432/appdb?sslmode=disable"
+      # <-- Изменено на postgres -->
+      DATA_SOURCE_NAME: "postgresql://replicator:replicator_pass@postgres-replica:5432/postgres?sslmode=disable"
     networks:
       - postgres-replication
 

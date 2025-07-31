@@ -20,7 +20,7 @@ cat >> ${PGDATA}/postgresql.conf <<EOF
 
 # --- Standby Configuration ---
 primary_conninfo = 'host=postgres-primary port=5432 user=${REPLICATOR_USER} password=${REPLICATOR_PASSWORD} application_name=replica1'
-# primary_slot_name = 'replica1_slot' # Убираем на время тестирования
+primary_slot_name = 'replica1_slot'
 hot_standby = on
 # -----------------------------
 EOF

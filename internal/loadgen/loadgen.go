@@ -2,15 +2,20 @@ package loadgen
 
 import (
 	"context"
-	"fmt"
-	"log"
+
+    "fmt"
+    "log"
+    "time"
+
+    "github.com/jackc/pgx/v5/pgxpool"
+	
 	"math/rand"
 	"sync"
 	"sync/atomic"
-	"time"
+	
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/thanhpk/randstr"
 
 	"PGLoadBalance/internal/monitoring"
@@ -31,10 +36,10 @@ type TableState struct {
 	emptyTuplesBytes atomic.Int64
 	liveTupleBytes   atomic.Int64
 	deadTupleBytes   atomic.Int64
-	delta            atomic.Int64
 	rand             *rand.Rand
 	minSizeBytes     atomic.Int64
 	maxSizeBytes     atomic.Int64
+	currentSizeForTable atomic.Int64
 }
 
 type LoadGen struct {
@@ -115,7 +120,7 @@ func (lg *LoadGen) Run(ctx context.Context) {
 }
 
 func (lg *LoadGen) sizePoller(ctx context.Context) {
-	ticker := time.NewTicker(300 * time.Millisecond)
+	ticker := time.NewTicker(333 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -199,7 +204,8 @@ func (lg *LoadGen) runTable(ctx context.Context, table *TableState) {
 }
 
 func (lg *LoadGen) observer(ctx context.Context, table *TableState, dbSizeMB int64) {
-		lg.checkMaintenance(ctx, table)
+			lg.checkMaintenance(ctx, table)
+	
 	// Распределение общего размера БД по таблицам
 	n := int64(len(lg.tables))
 	dbSizePerTable := (dbSizeMB * 1024 * 1024) / n
@@ -213,9 +219,9 @@ func (lg *LoadGen) observer(ctx context.Context, table *TableState, dbSizeMB int
 		//log.Printf("perrrrr %d", dbSizePerTable)
 	//
 
+	table.currentSizeForTable.Store(dbSizePerTable)
+
 	mode := insertMode
-	delta := (dbSizePerTable - lg.getTablePhysicalSize(table))
-	table.delta.Store(delta)
 	minSizeBytes := (lg.minSizeMB * 1024 * 1024) / n
 	maxSizeBytes := (lg.maxSizeMB * 1024 * 1024) / n
 
@@ -230,30 +236,23 @@ func (lg *LoadGen) observer(ctx context.Context, table *TableState, dbSizeMB int
 	table.maxSizeBytes.Store(maxSizeBytes)
 
 	
-	hys := float64(maxSizeBytes - minSizeBytes) * 0.1  // 10% гистерезис
-aggressive := table.rand.Float64() < 0.3  // 30% шанс агрессивного действия
+	hys := float64(maxSizeBytes - minSizeBytes) * 0.05 // 5% гистерезис
 
 switch {
 case dbSizePerTable < minSizeBytes + int64(hys):
     mode = insertMode
-    if aggressive {
-        mode = insertMode // Агрессивная вставка
-    }
 case dbSizePerTable > maxSizeBytes - int64(hys):
     mode = deleteMode
-    if aggressive {
-        mode = deleteMode // Агрессивное удаление
-    }
 default:
     // Случайный выбор с приоритетом на update
-    rnd := table.rand.Intn(10)
+    rnd := table.rand.Intn(3)
     switch {
-    case rnd < 4: // 40% вероятность
-        mode = updateMode
-    case rnd < 7: // 30% вероятность
+    case rnd == 0: 
         mode = insertMode
-    default: // 30% вероятность
+    case rnd == 1: 
         mode = deleteMode
+    default: 
+        mode = updateMode
     }
 }
 
@@ -267,27 +266,12 @@ default:
 	}
 }
 
-
-func (lg *LoadGen) getTablePhysicalSize(table *TableState) int64 {
-    return table.liveTupleBytes.Load() + table.deadTupleBytes.Load() + table.emptyTuplesBytes.Load()
-}
-
 func (lg *LoadGen) batchInsert(
 	ctx context.Context,
 	table *TableState,
 ) error {
 
-	if table.maxSizeBytes.Load() <= lg.getTablePhysicalSize(table){
-		log.Printf("NO INSERT maxSizeBytes <= currentSizeBytes")
-		return nil
-	}
-delta := table.delta.Load()
-if (delta < 0 ){
-	delta = 0
-}
-	
-
-	freeSpaceBytes := table.maxSizeBytes.Load() - table.deadTupleBytes.Load() - table.emptyTuplesBytes.Load() - delta
+	freeSpaceBytes := table.maxSizeBytes.Load() - table.currentSizeForTable.Load() + table.emptyTuplesBytes.Load()
 
 	if freeSpaceBytes <= 0 {
 		log.Printf("[%s] No space available for insert", table.name)
@@ -300,7 +284,7 @@ if (delta < 0 ){
 		return nil
 	}
 
-	maxAllowedToInsert := int(float64(table.maxSizeBytes.Load() - table.minSizeBytes.Load()) * 0.0253 / avgTupleLen)
+	maxAllowedToInsert := int(float64(table.maxSizeBytes.Load() - table.minSizeBytes.Load()) *  0.03 / avgTupleLen)
 
 	if maxInsertRows > maxAllowedToInsert {
 		maxInsertRows =maxAllowedToInsert
@@ -338,14 +322,23 @@ func (lg *LoadGen) randomDelete(
 	toDeleteBytes := table.liveTupleBytes.Load() - table.minSizeBytes.Load()
 	toDeleteTuples := int(toDeleteBytes / avgTupleLen)
 
-	log.Printf("TODELETETUPLRS %d liveTupleByte %d minSizeBytes %d delta %d", toDeleteTuples, table.liveTupleBytes.Load(),table.minSizeBytes.Load(), table.delta.Load() )
-	 maxAllowedDelete := int(float64(table.maxSizeBytes.Load() - table.minSizeBytes.Load()) * 0.0253 / avgTupleLen)
+	log.Printf("TODELETETUPLRS %d liveTupleByte %d minSizeBytes %d dead %d", toDeleteTuples, table.liveTupleBytes.Load(),table.minSizeBytes.Load(),table.deadTupleBytes.Load() )
+	 maxAllowedDelete := int(float64(table.maxSizeBytes.Load() - table.minSizeBytes.Load()) *  0.03 / avgTupleLen)
 
-	if toDeleteTuples <= 0 {
-		return nil
-	} else if toDeleteTuples > maxAllowedDelete {
-		toDeleteTuples = maxAllowedDelete
-	}
+	 if ( maxAllowedDelete < avgTupleLen){
+		maxAllowedDelete = avgTupleLen
+	 }
+
+	 if toDeleteTuples <= 0 {
+        log.Printf("[%s] No tuples eligible for delete", table.name)
+        return nil
+    }
+	// if toDeleteTuples <= 0 {
+	// 	lg.pool.Exec(ctx, queries.Vacuum(table.name))
+	// 	return nil
+	// } else if toDeleteTuples > maxAllowedDelete {
+	// 	toDeleteTuples = maxAllowedDelete
+	// }
 	rowsToDelete := table.rand.Intn(toDeleteTuples) + 1
 	
 	query := queries.Delete(table.name, rowsToDelete)
@@ -360,21 +353,36 @@ func (lg *LoadGen) randomDelete(
 
 func (lg *LoadGen) batchUpdate(ctx context.Context, table *TableState, maxSizeBytes int64, minSizeBytes int64) error {
 	// меньшее между строк что можно удалить и добавить
-	// freeSpaceBytes := maxSizeBytes - lg.getTablePhysicalSize(table) + table.emptyTuplesBytes.Load()/2 - table.delta.Load()
-	// freeSpaceBytes = int64(float64(freeSpaceBytes)*0.7)
 
-	// maxInsertRows := int(freeSpaceBytes / avgTupleLen)
-	// toDeleteBytes := lg.getTablePhysicalSize(table) - minSizeBytes - table.deadTupleBytes.Load() - table.emptyTuplesBytes.Load() + table.delta.Load()/2
-    // toDeleteBytes = int64(float64(toDeleteBytes)*0.7)
-	// toDeleteTuples := int(toDeleteBytes / avgTupleLen)
+      freeSpaceBytes := table.maxSizeBytes.Load() - table.currentSizeForTable.Load() + table.emptyTuplesBytes.Load()
 
-    
-	// minRows := maxInsertRows
-	//  if toDeleteTuples < minRows {
-	// 	minRows = toDeleteTuples
-	//  }
-	minRows:=1
-	 maxAllowedToUpdate := int(float64(table.maxSizeBytes.Load() - table.minSizeBytes.Load()) * 0.0253 / avgTupleLen)
+	if freeSpaceBytes <= 0 {
+		log.Printf("[%s] No space available for insert", table.name)
+		return nil
+	}
+
+	maxInsertRows := int(freeSpaceBytes / avgTupleLen)
+	if maxInsertRows <= 0 {
+		log.Printf("NO UPDATE maxInsertRows <= 0 ")
+		return nil
+	}
+
+	if (table.liveTupleBytes.Load()<=table.minSizeBytes.Load()){
+
+       lg.pool.Exec(ctx, queries.Vacuum(table.name))
+		return nil
+	}
+	toDeleteBytes := table.liveTupleBytes.Load() - table.minSizeBytes.Load()
+	toDeleteTuples := int(toDeleteBytes / avgTupleLen)
+    if toDeleteTuples <= 0 {
+		log.Printf("NO UPDATE maxInsertRows <= 0 ")
+		return nil
+	}
+	minRows := maxInsertRows
+	 if toDeleteTuples < minRows {
+		minRows = toDeleteTuples
+	 }
+	 maxAllowedToUpdate := int(float64(table.maxSizeBytes.Load() - table.minSizeBytes.Load()) * 0.03 / avgTupleLen)
 
 	if minRows > maxAllowedToUpdate {
 		minRows = maxAllowedToUpdate
@@ -400,6 +408,7 @@ func (lg *LoadGen) batchUpdate(ctx context.Context, table *TableState, maxSizeBy
 	return nil
 }
 
+
 func (lg *LoadGen) checkMaintenance(ctx context.Context, table *TableState) {
 	tupBytes, deadBytes, freeBytes, err := lg.mon.GetPgstattupleStats(ctx, table.name)
 	if err != nil {
@@ -409,7 +418,9 @@ func (lg *LoadGen) checkMaintenance(ctx context.Context, table *TableState) {
 	table.liveTupleBytes.Store(tupBytes)
 	table.emptyTuplesBytes.Store(freeBytes)
 	table.deadTupleBytes.Store(deadBytes)
-   vacuumStart := int(float64(table.maxSizeBytes.Load() - table.minSizeBytes.Load()) * 0.005 / avgTupleLen)
+
+		log.Printf("dead %d", deadBytes)
+   vacuumStart := int(float64(table.maxSizeBytes.Load() - table.minSizeBytes.Load()) * 0.0020 / avgTupleLen)
 	if float64(deadBytes/avgTupleLen) >= float64(vacuumStart) {
 		log.Printf("[%s] Trigger manual VACUUM", table.name)
         lg.pool.Exec(ctx, queries.Vacuum(table.name))
@@ -418,12 +429,20 @@ func (lg *LoadGen) checkMaintenance(ctx context.Context, table *TableState) {
         table.liveTupleBytes.Store(tupBytes)
         table.deadTupleBytes.Store(deadBytes)
         table.emptyTuplesBytes.Store(freeBytes)
+		log.Printf("deadBytes %d", deadBytes)
 	}
 
-	n := int64(len(lg.tables))
-	rangeSize := (lg.maxSizeMB - lg.minSizeMB) * 1024 * 1024 / n
-	if float64(rangeSize)*0.8 <= float64(freeBytes) {
+	 log.Printf(
+        "[%s] VACUUM FULL check: threshold=%d  (free=%d dead=%d)",
+        table.name, freeBytes, deadBytes,
+    )
+
+
+	rangeSize := (table.maxSizeBytes.Load() - table.minSizeBytes.Load())
+	if float64(rangeSize)*0.7 <= float64(table.emptyTuplesBytes.Load()+table.deadTupleBytes.Load()) {
 		log.Printf("[%s] Running VACUUM FULL", table.name)
+		// Добавляем подробное логирование
+   
 		lg.pool.Exec(ctx, queries.VacuumFull(table.name))
 		
 			tupBytes, deadBytes, freeBytes, _ := lg.mon.GetPgstattupleStats(ctx, table.name)
@@ -434,4 +453,3 @@ func (lg *LoadGen) checkMaintenance(ctx context.Context, table *TableState) {
 		
 	}
 }
-
