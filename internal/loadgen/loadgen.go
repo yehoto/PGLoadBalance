@@ -83,11 +83,11 @@ func (lg *LoadGen) Run(ctx context.Context) {
 	}
 
 	for _, table := range lg.tables {
-		_, err := lg.pool.Exec(ctx, queries.CreateTable(table.name))
-		if err != nil {
-			log.Printf("Failed to create table %s: %v", table.name, err)
-			return
-		}
+		// _, err := lg.pool.Exec(ctx, queries.CreateTable(table.name))
+		// if err != nil {
+		// 	log.Printf("Failed to create table %s: %v", table.name, err)
+		// 	return
+		// }
 		_, err = lg.pool.Exec(ctx, queries.DisableAutovacuum(table.name))
 		if err != nil {
 			log.Printf("Failed to disable autovacuum: %v", err)
