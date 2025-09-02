@@ -12,7 +12,5 @@ URL: http://localhost:3000
 
 Home -> Connections -> add data source (Prometheus: http://prometheus:9090)
 
-Пример дашборда для импорта: PostgreSQL Database Dashboard: 9628
-
 ## просматривать логи в режиме реального времени
 docker logs -f docker-loadgen-1
