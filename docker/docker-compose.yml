@@ -1,4 +1,4 @@
-version: '3.8'
+# version: '3.8'
 services:
   postgres-primary:
     image: postgres:16
@@ -7,22 +7,9 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: your_super_secret_postgres_password
-      POSTGRES_DB: appdb
-      # Переменные для логической репликации
+
       REPLICATOR_USER: replicator
       REPLICATOR_PASSWORD: replicator_pass
-    command:
-      - postgres
-      - -c
-      - wal_level=logical
-      - -c
-      - max_replication_slots=10
-      - -c
-      - max_wal_senders=10
-      - -c
-      - hot_standby=on
-      - -c
-      - listen_addresses=*
     volumes:
       - primary_data:/var/lib/postgresql/data
       - ./init-primary.sh:/docker-entrypoint-initdb.d/init-primary.sh
@@ -31,11 +18,11 @@ services:
     networks:
       - postgres-replication
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h localhost -U postgres -d appdb || exit 1"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"] 
       interval: 5s
-      timeout: 10s
-      retries: 30
-      start_period: 120s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   postgres-replica:
     image: postgres:16
@@ -49,60 +36,39 @@ services:
       - replica_data:/var/lib/postgresql/data
       - ./init-replica.sh:/docker-entrypoint-initdb.d/init-replica.sh
     ports:
-      - "5436:5432"
+      - "5434:5432"
     depends_on:
-      postgres-primary:
-        condition: service_healthy
+      - postgres-primary
     networks:
       - postgres-replication
 
   loadgen:
-      build:
-        context: ..
-        dockerfile: Dockerfile
-      container_name: loadgen
-      command: ["/loadgen", "-min-size", "100", "-max-size", "300"]
-      ports:
-        - "2112:2112"
-      environment:
-        DSN: "postgres://replicator@postgres-primary:5432/appdb?sslmode=disable"
-      depends_on:
-        postgres-primary:
-          condition: service_healthy
-      networks:
-        - postgres-replication
-      healthcheck:
-        test: ["CMD-SHELL", "pg_isready -h postgres-primary -U replicator -d appdb || exit 1"]
-        interval: 5s
-        timeout: 10s
-        retries: 15
-
-  create-subscription:
-    image: postgres:16
-    container_name: create-subscription
-    volumes:
-      - ./create_subscription.sh:/create_subscription.sh
-    command:
-      - bash
-      - /create_subscription.sh
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: loadgen
+    command: ["/loadgen", "-min-size", "100", "-max-size", "300"]
+    ports:
+      - "2112:2112"
+    environment:
+      DSN: "postgres://replicator:replicator_pass@postgres-primary:5432/postgres?sslmode=disable"
     depends_on:
       postgres-primary:
         condition: service_healthy
     networks:
       - postgres-replication
 
-
   pg_exporter_master:
     image: prometheuscommunity/postgres-exporter:latest
     environment:
-      DATA_SOURCE_NAME: "postgresql://replicator:replicator_pass@postgres-primary:5432/appdb?sslmode=disable"
+      DATA_SOURCE_NAME: "postgresql://replicator:replicator_pass@postgres-primary:5432/postgres?sslmode=disable"
     networks:
       - postgres-replication
 
   pg_exporter_replica:
     image: prometheuscommunity/postgres-exporter:latest
     environment:
-      DATA_SOURCE_NAME: "postgresql://replicator:replicator_pass@postgres-replica:5432/appdb?sslmode=disable"
+      DATA_SOURCE_NAME: "postgresql://replicator:replicator_pass@postgres-replica:5432/postgres?sslmode=disable"
     networks:
       - postgres-replication
 

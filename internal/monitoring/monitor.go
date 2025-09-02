@@ -18,7 +18,7 @@ func New(pool *pgxpool.Pool) *Monitor {
 func (m *Monitor) GetDBSize() (int64, error) {
 	var size int64
 	err := m.pool.QueryRow(context.Background(), "SELECT pg_database_size(current_database())").Scan(&size)
-	return size / (1024 * 1024), err // в MB
+	return size / (1024 * 1024), err
 }
 
 func (m *Monitor) GetTableSize(ctx context.Context, tableName string) (int64, error) {

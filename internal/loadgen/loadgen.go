@@ -52,7 +52,6 @@ type LoadGen struct {
 	currentDbSize atomic.Int64
 	notifyCh     chan struct{}
 	mu           sync.Mutex
-	// Добавляем барьерный WaitGroup и флаг остановки
 	barrierWg    sync.WaitGroup
 	shutdown     atomic.Bool
 }
@@ -83,31 +82,31 @@ func (lg *LoadGen) Run(ctx context.Context) {
 	}
 
 	for _, table := range lg.tables {
-		// _, err := lg.pool.Exec(ctx, queries.CreateTable(table.name))
-		// if err != nil {
-		// 	log.Printf("Failed to create table %s: %v", table.name, err)
-		// 	return
-		// }
+		_, err := lg.pool.Exec(ctx, queries.CreateTable(table.name))
+		if err != nil {
+			log.Printf("Failed to create table %s: %v", table.name, err)
+			return
+		}
 		_, err = lg.pool.Exec(ctx, queries.DisableAutovacuum(table.name))
 		if err != nil {
 			log.Printf("Failed to disable autovacuum: %v", err)
 		}
 	}
 
-	 // Первоначальный запрос размера БД
+	
 	dbSizeMB, err := lg.mon.GetDBSize()
 	if err == nil {
 		lg.currentDbSize.Store(dbSizeMB)
 	}
 
-	// Запуск sizePoller
+
 	lg.wg.Add(1)
 	go func() {
 		defer lg.wg.Done()
 		lg.sizePoller(ctx)
 	}()
 
-	// Запуск горутин для таблиц
+
 	for _, table := range lg.tables {
 		lg.wg.Add(1)
 		go func(t *TableState) {
@@ -142,10 +141,10 @@ func (lg *LoadGen) sizePoller(ctx context.Context) {
 			}
 			lg.currentDbSize.Store(dbSizeMB)
 
-			// Инициализируем барьер
+		
 			lg.barrierWg.Add(len(lg.tables))
 			
-			// Отправляем уведомление
+		
 			lg.mu.Lock()
 			oldCh := lg.notifyCh
 			lg.notifyCh = make(chan struct{})
@@ -155,17 +154,17 @@ func (lg *LoadGen) sizePoller(ctx context.Context) {
 				close(oldCh)
 			}
 			
-			// Ждем завершения обработки всеми горутинами
+		
 			done := make(chan struct{})
 			go func() {
 				lg.barrierWg.Wait()
 				close(done)
 			}()
 			
-			// С таймаутом на случай зависаний
+			
 			select {
 			case <-done:
-				// Все горутины завершили обработку
+				
 			case <-time.After(2 * time.Second):
 				log.Println("Timeout waiting for table workers")
 			case <-ctx.Done():
@@ -182,23 +181,23 @@ func (lg *LoadGen) runTable(ctx context.Context, table *TableState) {
 			return
 		}
 
-		// Получаем текущий канал уведомлений
+		
 		lg.mu.Lock()
 		ch := lg.notifyCh
 		lg.mu.Unlock()
 		
-		// Ожидаем уведомления или завершения
+		
 		select {
 		case <-ctx.Done():
 			return
 		case <-ch:
 		}
 
-		// Выполняем обработку
+		
 		dbSizeMB := lg.currentDbSize.Load()
 		lg.observer(ctx, table, dbSizeMB)
 		
-		// Уведомляем о завершении обработки
+		
 		lg.barrierWg.Done()
 	}
 }
@@ -206,18 +205,16 @@ func (lg *LoadGen) runTable(ctx context.Context, table *TableState) {
 func (lg *LoadGen) observer(ctx context.Context, table *TableState, dbSizeMB int64) {
 			lg.checkMaintenance(ctx, table)
 	
-	// Распределение общего размера БД по таблицам
+	
 	n := int64(len(lg.tables))
 	dbSizePerTable := (dbSizeMB * 1024 * 1024) / n
 
-	// Добавление остатка к первой таблице
+	
 	if table == lg.tables[0] {
 		remainder := (dbSizeMB * 1024 * 1024) % n
 		dbSizePerTable += remainder
 	}
    	log.Printf("DNSIZEMB %d", dbSizeMB)
-		//log.Printf("perrrrr %d", dbSizePerTable)
-	//
 
 	table.currentSizeForTable.Store(dbSizePerTable)
 
@@ -244,7 +241,7 @@ case dbSizePerTable < minSizeBytes + int64(hys):
 case dbSizePerTable > maxSizeBytes - int64(hys):
     mode = deleteMode
 default:
-    // Случайный выбор с приоритетом на update
+ 
     rnd := table.rand.Intn(3)
     switch {
     case rnd == 0: 
@@ -352,7 +349,6 @@ func (lg *LoadGen) randomDelete(
 }
 
 func (lg *LoadGen) batchUpdate(ctx context.Context, table *TableState, maxSizeBytes int64, minSizeBytes int64) error {
-	// меньшее между строк что можно удалить и добавить
 
       freeSpaceBytes := table.maxSizeBytes.Load() - table.currentSizeForTable.Load() + table.emptyTuplesBytes.Load()
 
@@ -424,7 +420,6 @@ func (lg *LoadGen) checkMaintenance(ctx context.Context, table *TableState) {
 	if float64(deadBytes/avgTupleLen) >= float64(vacuumStart) {
 		log.Printf("[%s] Trigger manual VACUUM", table.name)
         lg.pool.Exec(ctx, queries.Vacuum(table.name))
-		 // Обновите данные сразу после VACUUM!
         tupBytes, deadBytes, freeBytes, _ := lg.mon.GetPgstattupleStats(ctx, table.name)
         table.liveTupleBytes.Store(tupBytes)
         table.deadTupleBytes.Store(deadBytes)
@@ -441,7 +436,6 @@ func (lg *LoadGen) checkMaintenance(ctx context.Context, table *TableState) {
 	rangeSize := (table.maxSizeBytes.Load() - table.minSizeBytes.Load())
 	if float64(rangeSize)*0.7 <= float64(table.emptyTuplesBytes.Load()+table.deadTupleBytes.Load()) {
 		log.Printf("[%s] Running VACUUM FULL", table.name)
-		// Добавляем подробное логирование
    
 		lg.pool.Exec(ctx, queries.VacuumFull(table.name))
 		
