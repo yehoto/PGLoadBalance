@@ -16,24 +16,3 @@ Home -> Connections -> add data source (Prometheus: http://prometheus:9090)
 
 ## просматривать логи в режиме реального времени
 docker logs -f docker-loadgen-1
-
-## запуск и остановка контейнеров
-- docker volume rm pg_logic_replica_data
-- docker volume rm pg_phys_replica_data
-- docker volume rm pg_master_data
-- docker volume rm grafana_data
-- docker volume create grafana_data
-- docker volume create pg_logic_replica_data
-- docker volume create pg_master_data
-- docker volume create pg_phys_replica_data
-- docker-compose up -d ( docker-compose up -d --build )
-- docker-compose down -v
-
-docker volume rm pg_logic_replica_data
-docker volume rm pg_phys_replica_data
-docker volume rm pg_master_data
-docker volume rm grafana_data
-docker volume create grafana_data
-docker volume create pg_logic_replica_data
-docker volume create pg_master_data
-docker volume create pg_phys_replica_data
